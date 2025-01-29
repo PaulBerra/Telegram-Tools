@@ -1,8 +1,8 @@
 import requests
 
 # Configuration
-BOT_TOKEN = "7749516098:AAGu1gvQhJBJWroNByC0peswDlM8FRG478Y"  # Token de votre bot
-CHAT_ID = "7422779400"  # ID du groupe (commence par un "-")
+BOT_TOKEN = "XXXX:XXXX"  # Token de votre bot
+CHAT_ID = "XXXX"  # ID du groupe (commence par un "-")
 
 # Fonction pour récupérer un lien d'invitation
 def get_invite_link(bot_token, chat_id):
