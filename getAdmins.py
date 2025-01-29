@@ -1,8 +1,8 @@
 import requests
 
 # Configuration
-BOT_TOKEN = "1454028790:AAG9hlnXzgA0uyRsJTkAttLkMWQ480JHXDU"
-CHAT_ID = "-652054017"  # ID du groupe
+BOT_TOKEN = "XXXX:XXXX"
+CHAT_ID = "-XXX"  # ID du groupe
 
 # Fonction pour récupérer les administrateurs du groupe
 def get_chat_administrators(bot_token, chat_id):
