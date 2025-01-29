@@ -2,7 +2,7 @@ import requests
 import time
 
 # Configuration
-BOT_TOKEN = "1454028790:AAG9hlnXzgA0uyRsJTkAttLkMWQ480JHXDU"  # Token du bot
+BOT_TOKEN = "XXX:XXXX"  # Token du bot
 USERS = set()  # Utilisé pour stocker les utilisateurs uniques
 
 # Fonction pour écouter les utilisateurs
