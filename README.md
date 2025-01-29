@@ -109,3 +109,18 @@ This script:
 2. **Install dependencies:**
    ```bash
    pip install requests
+3. **Run script:**
+   ```
+   python3 script.py <args>
+   ```
+
+Notes and Recommendations
+
+    Keep tokens secure:
+    Do not share your bot token publicly. Store it in a safe location.
+
+    Verify permissions:
+    Make sure your bot has the necessary permissions in the target group. For example, it must be an administrator to retrieve member information or add new users.
+
+    API error handling:
+    If you encounter API errors (like HTTP 403 or 429), check the bot’s permissions, the chat ID, or consider waiting before retrying.
