@@ -1,9 +1,9 @@
 import requests
 
 # Configuration
-BOT_TOKEN = "1454028790:AAG9hlnXzgA0uyRsJTkAttLkMWQ480JHXDU"
-CHAT_ID = "-652054017"  # ID du groupe
-USER_ID = "559626717"  # Remplacez par l'ID de l'utilisateur
+BOT_TOKEN = "XXXX:XXXX"
+CHAT_ID = "-XXXX"  # ID du groupe
+USER_ID = "XXXX"  # Remplacez par l'ID de l'utilisateur
 
 # Fonction pour récupérer les informations d'un membre
 def get_chat_member(bot_token, chat_id, user_id):
