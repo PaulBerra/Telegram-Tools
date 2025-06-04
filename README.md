@@ -365,4 +365,8 @@ Please keep commits focused, include relevant tests/examples, and update this RE
 
 ## License
 
-This project is released under the [MIT License](LICENSE). Feel free to copy, modify, and redistribute as you wish.
+© 2025 Paul Berra. All Rights Reserved.
+
+Non-commercial use, modification and distribution of this software are permitted, provided that Paul Berra is credited and notified.  
+Commercial use or distribution is strictly prohibited without prior written permission.  
+Pour toute demande d’autorisation commerciale, contactez : paul.berra.pro@gmail.com 
