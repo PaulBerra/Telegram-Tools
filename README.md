@@ -117,7 +117,7 @@ Pour distribuer rapidement l’application sous forme d’un exécutable Windows
    
    ```powershell
       pyinstaller --noconfirm --onefile --windowed main.py --icon=logo.ico
-
+   ```
    --onefile : crée un seul fichier .exe.
 
    --windowed : désactive la console Windows (utile pour une GUI PyQt5).
@@ -130,13 +130,13 @@ Double-cliquez sur *dist\main.exe*. La fenêtre PyQt5 doit se lancer sans néces
 
 **Remarque** : si vous utilisez des chemins relatifs ou des fichiers supplémentaires (comme telegram_tools_cli.py), assurez-vous de :
 
-Les inclure dans le même dossier dist\ ou ajouter les options --add-data à PyInstaller, par exemple :
+Les inclure dans le même dossier dist\ ou ajouter les options "--add-data" à PyInstaller, par exemple :
 
    ```powershell
       pyinstaller --onefile --windowed --icon=logo.ico `
       --add-data "telegram_tools_cli.py;." `
       main.py
-
+   ```
 ---
 
 ## CLI Usage
