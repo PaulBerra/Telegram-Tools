@@ -52,14 +52,6 @@ source venv/bin/activate        # Linux/macOS
 # venv\Scripts\activate.bat      # Windows
 pip install -r requirements.txt
 ```
-
-A sample `requirements.txt` (generated via `pip freeze`) might look like:
-
-```
-PyQt5==5.15.6
-requests==2.31.0
-```
-
 ---
 
 ## Installation (Python)
