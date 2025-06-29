@@ -1,4 +1,8 @@
-# 🚀 Telegram Tools
+![image](https://github.com/user-attachments/assets/63d9bc07-5915-47eb-9022-46dbc895cfc6)
+
+
+
+# Telegram Tools
 
 A combined **CLI** and **Graphical** application for interacting with the Telegram Bot API. This project provides:
 
