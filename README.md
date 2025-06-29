@@ -1,6 +1,4 @@
-![image](https://github.com/user-attachments/assets/63d9bc07-5915-47eb-9022-46dbc895cfc6)
-
-
+![image](https://github.com/user-attachments/assets/a9042a56-6304-440a-a265-793794ce371c)
 
 # Telegram Tools
 
