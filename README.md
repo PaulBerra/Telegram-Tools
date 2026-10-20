@@ -13,6 +13,9 @@ Python 3.9+.
 ```bash
 pip install -r requirements.txt   # requests (CLI) + PyQt6 (GUI); telethon is optional, for MTProto
 python main.py                    # GUI
+#
+# OR
+#
 python telegram_tools_cli.py --help   # CLI
 ```
 
