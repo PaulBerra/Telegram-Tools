@@ -8,7 +8,7 @@ tokens.json
 .env
 .env.*
 *.env
-
+CDC_MODERNISATION.md
 # ---- Captured data / dumps / downloaded media ----------------------------
 *.ndjson
 *.jsonl

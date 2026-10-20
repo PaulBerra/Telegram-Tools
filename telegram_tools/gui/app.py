@@ -656,7 +656,7 @@ class RightsPage(BasePage):
         sw = QWidget(); sw.setStyleSheet("background:transparent;"); sw.setLayout(srow)
         self.card_lay.addWidget(sw)
 
-        title = QLabel("What can this admin do?")
+        title = QLabel("Admin rights")
         title.setStyleSheet(f"color:{ACCENT}; padding-top:6px;")
         self.card_lay.addWidget(title)
 
