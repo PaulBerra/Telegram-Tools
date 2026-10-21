@@ -1846,7 +1846,17 @@ class InvestigatorPage(BasePage):
         lab = QLabel(text); lab.setObjectName("Muted"); lab.setWordWrap(True); return lab
 
     # ---- enrichment ----
+    def _clear_enrich(self) -> None:
+        # Each run shows its own fresh results - otherwise old rows (e.g. a stale
+        # "not installed" from before you logged in) pile up and duplicate.
+        while self._enrich_box.count():
+            item = self._enrich_box.takeAt(0)
+            w = item.widget()
+            if w:
+                w.deleteLater()
+
     def _run_enrich(self, subject, which) -> None:
+        self._clear_enrich()
         provs = [which] if which is not None else [p for p in enrich.providers() if p.ready()[0]]
         if not provs:
             self._add_finding_row("No provider is ready. Set up TGStat / Telethon in the Keys tab.",

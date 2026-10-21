@@ -20,10 +20,23 @@ class TelethonProvider(Provider):
 
     def _config(self):
         from .. import creds
-        from ..mtproto.client import MTProtoConfig   # lazy: imports Telethon
+        from ...mtproto.client import MTProtoConfig   # lazy: imports Telethon
         c = creds.load_credentials()
         return MTProtoConfig(api_id=int(c["tg_api_id"]), api_hash=c["tg_api_hash"],
                              session=creds.SESSION, phone=c.get("tg_phone") or None)
+
+    @staticmethod
+    def _ensure_loop() -> None:
+        # Telethon (telethon.sync) needs an asyncio event loop in the CURRENT
+        # thread. Enrichment runs in a background worker thread, which has no loop
+        # by default on Python 3.12+, so build/connect would fail there. Give the
+        # thread a fresh loop. (The login flow happens to run early enough to have
+        # one; the enrich worker does not, which is why only this path broke.)
+        import asyncio
+        try:
+            asyncio.get_event_loop()
+        except RuntimeError:
+            asyncio.set_event_loop(asyncio.new_event_loop())
 
     def ready(self) -> tuple:
         # Cheap check for the UI: creds present + Telethon importable, no connect.
@@ -32,8 +45,8 @@ class TelethonProvider(Provider):
             return False, "Set api_id / api_hash and log in (Keys tab)."
         try:
             import telethon  # noqa: F401
-        except ImportError:
-            return False, "Telethon is not installed (pip install telethon)."
+        except Exception as exc:   # surface the REAL error, don't assume "missing"
+            return False, f"Telethon import failed: {exc}"
         return True, "Will verify the login when run."
 
     def available(self) -> tuple:
@@ -41,9 +54,10 @@ class TelethonProvider(Provider):
         if not creds.has_telethon_creds():
             return False, "Set api_id / api_hash in the Keys tab."
         try:
-            from ..mtproto.client import build_client
-        except ImportError:
-            return False, "Telethon is not installed (pip install telethon)."
+            from ...mtproto.client import build_client
+        except Exception as exc:
+            return False, f"Telethon import failed: {exc}"
+        self._ensure_loop()
         try:
             client = build_client(self._config())
             client.connect()
@@ -60,8 +74,8 @@ class TelethonProvider(Provider):
         ok, why = self.available()
         if not ok:
             return EnrichmentResult(self.name, ok=False, error=why)
-        from ..mtproto.client import build_client
-        from ..mtproto import features
+        from ...mtproto.client import build_client
+        from ...mtproto import features
         target = subject.username or subject.user_id
         if target is None:
             return EnrichmentResult(self.name, ok=False, error="No username or id to resolve.")
