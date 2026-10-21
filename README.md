@@ -4,8 +4,6 @@
 
 A Telegram OSINT toolkit to investigate a group or bot whose token you've caught - see what that access already reaches and turn it into intelligence. An optional user account unlocks what the Bot API forbids.
 
-> Authorized anti-scam use only: reads only what the bot or your account already accesses - no exploit.
-
 ## Limits
 
 | Target | Bot · member | Bot · admin | User account |
