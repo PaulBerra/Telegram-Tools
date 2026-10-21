@@ -19,12 +19,16 @@ python main.py                    # GUI
 python telegram_tools_cli.py --help   # CLI
 ```
 
-In the GUI, type your bot token at the top (it auto-connects and is remembered) and pick a chat; every tab shares them. The sidebar is grouped by intent:
+In the GUI, type your bot token at the top (it auto-connects and is remembered) and pick a chat; every tab shares them. The sidebar is four workspaces:
 
-- **Members** - admins, per-user info, the bot's own rights, invite links.
-- **Analyse** - a live **Conversation** timeline (Telegram-style) and a **Report** dashboard (links, senders, crypto, phones over time), with a per-sender profile: activity, active hours, top words, what they shared.
+- **Terrain** - field work on one group through a bot: a live **Conversation** timeline (Telegram-style, with a composer to post as the bot), a **Report** dashboard (links, senders, crypto, phones over time with Splunk-style drill-down per sender), admins, the bot's own rights, invite links.
+- **Investigateur** - zoom on one subject across *every* bot's collected data: their groups, the users they're connected to, indicators they shared, activity/hours/words, then **enrich** from outside sources (web-search leads and the `t.me` preview with no account; common-groups, flags and the real id via your own account when you set up **Keys**).
+- **Nexus** - the whole thing as an interactive graph: users, the groups they post in, and the indicators they share, linked across all your bots and sources. Two accounts that share a group - or the same crypto address - are tied together through it. Click a node to inspect, double-click to investigate.
+- **Connection** - the bot token/chat picker and **Keys** (optional Telethon credentials + provider API keys, stored locally).
 
 Messages are collected passively as the bot sees them, and older ones are walked in the background (rate-limit aware, a few chats at a time, the open chat first). The gear (bottom-right) opens **Settings** - pace, theme incl. **dark mode**, limits - and **Manage bots**, which permanently deletes stored data. On the CLI the token can also come from the `TELEGRAM_BOT_TOKEN` environment variable.
+
+> OSINT reminder: this works on public data and your own bots' collected data only. External enrichment is best-effort and partial (Telegram exposes no "which groups is this user in"), every finding is labelled with its source, and it's meant for authorized anti-scam investigation - not for intruding into private groups.
 
 ## Usage
 

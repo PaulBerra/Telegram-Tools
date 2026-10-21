@@ -229,6 +229,85 @@ class BackfillWorker(QThread):
             self.failed.emit(str(exc))
 
 
+class EnrichWorker(QThread):
+    """Run a set of enrichment providers for one subject off the UI thread,
+    emitting each provider's result as it lands (some do network I/O)."""
+
+    result = pyqtSignal(object)   # EnrichmentResult
+    done = pyqtSignal()
+
+    def __init__(self, providers, subject, parent=None):
+        super().__init__(parent)
+        self._providers = list(providers)
+        self._subject = subject
+
+    def run(self) -> None:
+        from ..core.enrich.base import EnrichmentResult
+        for p in self._providers:
+            try:
+                res = p.enrich(self._subject)
+            except Exception as exc:
+                res = EnrichmentResult(getattr(p, "name", "?"), ok=False, error=str(exc))
+            self.result.emit(res)
+        self.done.emit()
+
+
+class TelethonLoginWorker(QThread):
+    """Drive Telethon's interactive login off-thread. It blocks on the code/
+    password until the GUI supplies them (via provide_code / provide_password)."""
+
+    code_needed = pyqtSignal()
+    password_needed = pyqtSignal()
+    done = pyqtSignal(object)      # {id, username, first_name, phone}
+    failed = pyqtSignal(str)
+
+    def __init__(self, api_id, api_hash, phone, session, parent=None):
+        super().__init__(parent)
+        self._api_id, self._api_hash = api_id, api_hash
+        self._phone, self._session = phone, session
+        self._code = None
+        self._pw = None
+        self._code_ev = threading.Event()
+        self._pw_ev = threading.Event()
+
+    def provide_code(self, code: str) -> None:
+        self._code = code
+        self._code_ev.set()
+
+    def provide_password(self, pw: str) -> None:
+        self._pw = pw
+        self._pw_ev.set()
+
+    def run(self) -> None:
+        try:
+            import telethon.sync  # noqa: F401  (blocking calls in this thread)
+            from telethon import TelegramClient
+            from telethon.errors import SessionPasswordNeededError
+        except Exception as exc:
+            self.failed.emit(f"Telethon not installed: {exc}")
+            return
+        try:
+            client = TelegramClient(self._session, int(self._api_id), self._api_hash)
+            client.connect()
+            if not client.is_user_authorized():
+                client.send_code_request(self._phone)
+                self.code_needed.emit()
+                self._code_ev.wait()
+                try:
+                    client.sign_in(self._phone, (self._code or "").strip())
+                except SessionPasswordNeededError:
+                    self.password_needed.emit()
+                    self._pw_ev.wait()
+                    client.sign_in(password=self._pw or "")
+            me = client.get_me()
+            out = {"id": me.id, "username": me.username,
+                   "first_name": me.first_name, "phone": me.phone}
+            client.disconnect()
+            self.done.emit(out)
+        except Exception as exc:
+            self.failed.emit(str(exc))
+
+
 class ArchiveWorker(QThread):
     """Run the id-deduction archive hack with live progress and cancellation."""
 

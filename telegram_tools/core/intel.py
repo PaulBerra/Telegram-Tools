@@ -65,6 +65,20 @@ def load_messages(ndjson_path: str) -> list[dict]:
     return list(_iter_messages(ndjson_path))
 
 
+def extract_indicators(text: str) -> list[tuple[str, str]]:
+    """Every (type, value) indicator in some text, de-duplicated, in a stable
+    order. Shared by the intel dashboard and the relationship graph."""
+    out: list[tuple[str, str]] = []
+    seen: set[tuple[str, str]] = set()
+    for kind, pat in _PATTERNS.items():
+        for m in pat.finditer(text or ""):
+            pair = (kind, m.group(0).strip())
+            if pair not in seen:
+                seen.add(pair)
+                out.append(pair)
+    return out
+
+
 def _msg_date(msg: dict) -> Optional[int]:
     # Prefer the ORIGINAL message date (it's what matters for OSINT), not the
     # date of the forwarded copy.

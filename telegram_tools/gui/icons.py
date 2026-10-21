@@ -53,6 +53,13 @@ _SHAPES: dict[str, str] = {
             '<path d="M5 15V5a2 2 0 0 1 2-2h10"/>',
     "forward": '<path d="M12 8V4l8 8-8 8v-4H4V8z"/>',
     "arrow_up": '<path d="M12 20V5M6 11l6-6 6 6"/>',
+    "scan": '<circle cx="10" cy="9" r="3.4"/>'
+            '<path d="M3.5 20c0-3.5 3-5.6 6.5-5.6 1 0 2 .18 2.9.5"/>'
+            '<circle cx="16.5" cy="16" r="3.1"/><path d="M18.8 18.3L22 21.5"/>',
+    "share": '<circle cx="6" cy="12" r="2.3" fill="{c}" stroke="none"/>'
+             '<circle cx="18" cy="6" r="2.3" fill="{c}" stroke="none"/>'
+             '<circle cx="18" cy="18" r="2.3" fill="{c}" stroke="none"/>'
+             '<path d="M8 11l8-4M8 13l8 4"/>',
     "gear": '<circle cx="12" cy="12" r="3.2"/>'
             '<path d="M12 3.5v2M12 18.5v2M3.5 12h2M18.5 12h2M6 6l1.4 1.4M16.6 16.6L18 18'
             'M18 6l-1.4 1.4M7.4 16.6L6 18"/>',

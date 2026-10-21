@@ -14,21 +14,24 @@ from typing import Any, Callable, Optional
 # What a Telegram bot token looks like: digits ":" then a long opaque string.
 _TOKEN_RE = re.compile(r"^\d{5,}:[A-Za-z0-9_-]{30,}$")
 
-from PyQt6.QtCore import Qt, QSize, QTimer
-from PyQt6.QtGui import QAction, QColor, QFont, QPalette, QPixmap
+from PyQt6.QtCore import Qt, QSize, QTimer, QUrl, pyqtSignal
+from PyQt6.QtGui import QAction, QColor, QDesktopServices, QFont, QPalette, QPixmap
 from PyQt6.QtWidgets import (
     QApplication, QAbstractItemView, QCheckBox, QComboBox, QDialog, QDialogButtonBox,
     QDoubleSpinBox, QFileDialog, QFormLayout, QFrame, QGridLayout, QHBoxLayout,
-    QHeaderView, QLabel, QLineEdit, QListWidget, QListWidgetItem, QMainWindow, QMenu,
-    QMessageBox, QPlainTextEdit, QProgressBar, QPushButton, QScrollArea, QSizePolicy,
-    QSpinBox, QStackedWidget, QTableWidget, QTableWidgetItem, QToolButton,
-    QTreeWidget, QTreeWidgetItem, QVBoxLayout, QWidget,
+    QHeaderView, QInputDialog, QLabel, QLineEdit, QListWidget, QListWidgetItem,
+    QMainWindow, QMenu, QMessageBox, QPlainTextEdit, QProgressBar, QPushButton,
+    QScrollArea, QSizePolicy, QSlider, QSpinBox, QSplitter, QStackedWidget,
+    QTableWidget, QTableWidgetItem, QToolButton, QTreeWidget, QTreeWidgetItem,
+    QVBoxLayout, QWidget, QWidgetAction,
 )
 
 from ..cli import _chat_arg
-from ..core import TelegramClient, api, archive, intel, rights_check
+from ..core import (TelegramClient, TelegramError, api, archive, creds, enrich,
+                    graph, intel, rights_check)
 from .charts import HBarList, TimeBars, stat_tile
 from .export import build_export_button, style_menu
+from .graphview import GraphView
 from .icons import app_icon, make_icon
 from . import store
 from . import theme
@@ -67,8 +70,8 @@ class DeletableMenu(QMenu):
         event.accept()  # never show Qt's default (empty) context menu here
 
 
-from .workers import (ArchiveWorker, BackfillWorker, CallWorker, GeneratorWorker,
-                      UpdatesPoller)
+from .workers import (ArchiveWorker, BackfillWorker, CallWorker, EnrichWorker,
+                      GeneratorWorker, TelethonLoginWorker, UpdatesPoller)
 
 ICON = QSize(16, 16)
 
@@ -87,6 +90,7 @@ def icon_button(text: str, icon_name: str, *, primary: bool = False) -> QPushBut
 def field(label_text: str, widget: QWidget) -> QWidget:
     """Stack a small muted label above an input, with tight uniform spacing."""
     box = QWidget()
+    box.setObjectName("Field")   # transparent via QSS, so no grey box on white cards
     lay = QVBoxLayout(box)
     lay.setContentsMargins(0, 0, 0, 0)
     lay.setSpacing(5)
@@ -106,6 +110,7 @@ class Session:
         self.bot_username: str = ""
         self.bot_id: Optional[int] = None
         self.known_chats: dict = {}   # chat_id(str) -> {id, title, type}
+        self.migrate_cb = None        # set by MainWindow: called on group->supergroup
 
     def is_connected(self) -> bool:
         """Single source of truth: are the bar's token/chat backing a live bot?"""
@@ -114,7 +119,7 @@ class Session:
     def client(self) -> TelegramClient:
         if not self.token:
             raise ValueError("Enter a bot token first.")
-        return TelegramClient(self.token)
+        return TelegramClient(self.token, on_migrate=self.migrate_cb)
 
     def require_chat(self) -> Any:
         if self.chat is None or self.chat == "":
@@ -255,6 +260,13 @@ class ConnectionPage(BasePage):
     def show_profile(self, prof: dict) -> None:
         me = prof.get("me", {})
         self.session.bot_username = me.get("username", "")
+        # Show a letter avatar straight away (like Bot rights); the real photo,
+        # if the bot has one reachable, replaces it when _show_avatar lands.
+        name = me.get("first_name") or me.get("username") or "bot"
+        self.avatar.setText(name[:1].upper())
+        self.avatar.setStyleSheet(
+            f"border-radius:32px; background:{SUCCESS}; color:#FFFFFF; "
+            f"font-size:24px; font-weight:600;")
         self.main.set_bot_status(True, f"@{me.get('username','?')}")
         lines = [f"<b>@{me.get('username','?')}</b> - id {me.get('id','?')}"]
         wh = prof.get("webhook_info", {})
@@ -278,10 +290,12 @@ class AdminsPage(BasePage):
         self._admins: list = []
         self._loaded_for = None
         bar = QHBoxLayout()
+        self.refresh_btn = icon_button("Refresh", "refresh")
+        self.refresh_btn.clicked.connect(lambda: self._go(self.refresh_btn))
         self.export_btn = build_export_button(
             self, [("Admin list", "admins", self._admins_dataset)], log=self.main.log)
         self.export_btn.setEnabled(False)
-        bar.addStretch(1); bar.addWidget(self.export_btn)
+        bar.addStretch(1); bar.addWidget(self.refresh_btn); bar.addWidget(self.export_btn)
         self.root.addLayout(bar)
         self.table = QTableWidget(0, 4)
         self.table.setHorizontalHeaderLabels(["Name", "Username", "ID", "Role"])
@@ -290,7 +304,7 @@ class AdminsPage(BasePage):
         self.table.verticalHeader().setDefaultSectionSize(34)
         self.table.setShowGrid(False)
         self.root.addWidget(self.table)
-        self._init_empty(self.export_btn, self.table)
+        self._init_empty(self.refresh_btn, self.export_btn, self.table)
 
     def on_shown(self) -> None:
         if not self._apply_empty_state():
@@ -313,7 +327,8 @@ class AdminsPage(BasePage):
             self.main.log(f"[ERROR] {e}")
             return
         self._loaded_for = chat
-        self.run(lambda: api.get_chat_administrators(client, chat), self._show, btn)
+        self.main.run_call(lambda: api.get_chat_administrators(client, chat), self._show,
+                           button=btn, on_error=lambda m: self.main.log(f"[ERROR] Admins: {m}"))
 
     def _show(self, admins: list) -> None:
         self._admins = admins
@@ -339,186 +354,6 @@ class AdminsPage(BasePage):
                          adm.get("status", "")])
         return ["id", "username", "name", "role"], rows
 
-
-class MemberPage(BasePage):
-    title = "Member info"
-    fill = True
-
-    def build(self) -> None:
-        self._loaded_for = None
-        self._all: list = []        # everyone seen in this chat
-        self._members: list = []    # currently displayed (filtered)
-
-        row = QHBoxLayout(); row.setSpacing(10)
-        self.uid = QLineEdit()
-        self.uid.setPlaceholderText("Type to filter, or a full id to search wider")
-        self._filter_timer = QTimer(self); self._filter_timer.setSingleShot(True)
-        self._filter_timer.timeout.connect(self._apply_filter)
-        self.uid.textChanged.connect(lambda: self._filter_timer.start(350))
-        self.export_btn = build_export_button(
-            self, [("Members seen", "members", self._members_dataset)], log=self.main.log)
-        self.export_btn.setEnabled(False)
-        row.addWidget(field("Search users", self.uid), 1)
-        row.addWidget(self.export_btn, 0, Qt.AlignmentFlag.AlignBottom)
-        self.root.addLayout(row)
-
-        self.table = QTableWidget(0, 4)
-        self.table.setHorizontalHeaderLabels(["Name", "Username", "ID", "Status"])
-        # Columns share the width evenly and everything is centred.
-        hdr = self.table.horizontalHeader()
-        hdr.setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
-        hdr.setDefaultAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.table.verticalHeader().setVisible(False)
-        self.table.verticalHeader().setDefaultSectionSize(32)
-        self.table.setShowGrid(False)
-        self.root.addWidget(self.table, 1)
-        # The table sizes to its rows (header + N rows) and a spacer fills the rest,
-        # so a short list stays pinned at the top - the same behaviour as the empty
-        # "No data" state. A long list fills the area and scrolls inside the table.
-        self._mp_spacer = QWidget(); self._mp_spacer.setStyleSheet("background:transparent;")
-        self._mp_spacer.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Expanding)
-        self.root.addWidget(self._mp_spacer)
-        self._show_empty_table()
-
-    def _cap_table(self) -> None:
-        """Cap the table's height to its content (header + rows), so it never
-        stretches past its data; the spacer below takes the slack."""
-        rh = self.table.verticalHeader().defaultSectionSize() or 32
-        hh = self.table.horizontalHeader().sizeHint().height() or 28
-        n = max(self.table.rowCount(), 1)
-        self.table.setMaximumHeight(hh + rh * n + 2 * self.table.frameWidth() + 2)
-
-    @staticmethod
-    def _cell(text: str) -> QTableWidgetItem:
-        item = QTableWidgetItem(text)
-        item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
-        return item
-
-    def on_shown(self) -> None:
-        key = (self.session.bot_id, self.session.chat)
-        if self.session.bot_id is not None and self.session.chat is not None \
-                and self._loaded_for != key:
-            self._auto_load()
-
-    def clear_view(self) -> None:
-        self._loaded_for = None
-        self._all = []
-        self._members = []
-        self._show_empty_table()
-        self.export_btn.setEnabled(False)
-
-    def _show_empty_table(self) -> None:
-        """Collapse the table to its header + one centered 'no data' row."""
-        self.table.clearSpans()
-        self.table.setRowCount(0)
-        self.table.insertRow(0)
-        self.table.setSpan(0, 0, 1, self.table.columnCount())
-        cell = self._cell("No data to show yet")
-        cell.setFlags(Qt.ItemFlag.ItemIsEnabled)   # shown, not selectable
-        self.table.setItem(0, 0, cell)
-        self._cap_table()
-
-    def _seen_users(self):
-        users = {}
-        for m in store.load_messages_for(self.session.bot_id, self.session.chat):
-            f = m.get("from") or {}
-            if f.get("id") is not None:
-                users.setdefault(f["id"], f)
-        return users
-
-    def _auto_load(self) -> None:
-        try:
-            client, chat = self.session.client(), self.session.require_chat()
-        except ValueError:
-            return
-        users = self._seen_users()
-        self._loaded_for = (self.session.bot_id, self.session.chat)
-        if not users:
-            self._all = []
-            self._apply_filter()
-            return
-        ids = list(users)[:300]
-
-        def job():
-            out = []
-            for uid in ids:
-                try:
-                    out.append(api.get_chat_member(client, chat, uid))
-                except TelegramError:
-                    f = users[uid]
-                    out.append({"user": {"id": uid, "username": f.get("username"),
-                                         "first_name": f.get("first_name")}, "status": "?"})
-            return out
-
-        def done(members):
-            self._all = members
-            self._apply_filter()
-        self.run(job, done)
-
-    def _render_table(self, members: list) -> None:
-        self._members = members
-        self.export_btn.setEnabled(bool(members))
-        if not members:
-            self._show_empty_table()
-            return
-        self.table.clearSpans()
-        self.table.setRowCount(0)
-        for info in members:
-            u = info.get("user", {})
-            r = self.table.rowCount(); self.table.insertRow(r)
-            vals = [f"{u.get('first_name','')} {u.get('last_name','')}".strip(),
-                    f"@{u.get('username','')}" if u.get("username") else "",
-                    str(u.get("id", "")), info.get("status", "")]
-            for c, v in enumerate(vals):
-                self.table.setItem(r, c, self._cell(v))
-        self._cap_table()
-
-    def _apply_filter(self) -> None:
-        text = self.uid.text().strip().lower()
-        if not text:
-            self._render_table(self._all)
-            return
-
-        def haystack(info):
-            u = info.get("user", {})
-            return (f"{u.get('id','')} {u.get('username','')} "
-                    f"{u.get('first_name','')} {u.get('last_name','')}").lower()
-
-        matches = [m for m in self._all if text in haystack(m)]
-        if matches:
-            self._render_table(matches)
-        elif text.isdigit() and len(text) >= 5:
-            # A full id with nothing in what we know -> look beyond this chat.
-            self._broader_lookup(int(text))
-        else:
-            self._render_table([])
-
-    def _broader_lookup(self, uid: int) -> None:
-        try:
-            client, chat = self.session.client(), self.session.require_chat()
-        except ValueError:
-            return
-
-        def job():
-            try:
-                return ("user", api.get_chat(client, uid))
-            except TelegramError:
-                return ("member", api.get_chat_member(client, chat, uid))
-
-        def done(res):
-            kind, data = res
-            info = data if kind == "member" else {"user": data, "status": "(not in this chat)"}
-            self._render_table([info])
-        self.run(job, done)
-
-    def _members_dataset(self):
-        rows = []
-        for info in self._members:
-            u = info.get("user", {})
-            rows.append([u.get("id"), u.get("username", ""),
-                         f"{u.get('first_name','')} {u.get('last_name','')}".strip(),
-                         info.get("status", "")])
-        return ["id", "username", "name", "status"], rows
 
 
 # Bot API getChatMember field -> Telegram "Admin rights" panel label, in TG order.
@@ -551,6 +386,13 @@ class RightsPage(BasePage):
 
     def build(self) -> None:
         self._loaded_for = None
+        bar = QHBoxLayout()
+        self.refresh_btn = icon_button("Refresh rights", "refresh")
+        self.refresh_btn.setToolTip("Re-read the bot's current rights from Telegram "
+                                    "(they aren't pushed - re-check after you change them).")
+        self.refresh_btn.clicked.connect(lambda: self._go(force=True))
+        bar.addStretch(1); bar.addWidget(self.refresh_btn)
+        self.root.addLayout(bar)
         self.card = QFrame()
         self.card.setObjectName("Card")
         self.card_lay = QVBoxLayout(self.card)
@@ -558,16 +400,16 @@ class RightsPage(BasePage):
         self.card_lay.setSpacing(10)
         self.card.setVisible(False)
         self.root.addWidget(self.card)
-        # The card shows itself only once rendered, so it isn't in the body list;
-        # the hint just needs to appear when disconnected.
-        self._init_empty()
+        # The card shows itself only once rendered; the refresh button hides with
+        # the body when disconnected.
+        self._init_empty(self.refresh_btn)
 
     def on_shown(self) -> None:
         if not self._apply_empty_state():
             return
-        # Auto-check once connected, unless we already did for this chat.
-        key = (self.session.bot_id, self.session.chat)
-        if self.session.chat is not None and self._loaded_for != key:
+        # Rights aren't pushed by Telegram, so re-read them every time the tab is
+        # opened - that way a permission you just changed shows up.
+        if self.session.chat is not None:
             self._go()
 
     def clear_view(self) -> None:
@@ -583,6 +425,7 @@ class RightsPage(BasePage):
             self.main.log(f"[ERROR] {e}")
             return
         self._loaded_for = (self.session.bot_id, chat)
+        bot_id = self.session.bot_id
 
         def job():
             member = api.get_bot_permissions(client, chat)
@@ -593,7 +436,20 @@ class RightsPage(BasePage):
                 member["_can_send"] = None
             return member
 
-        self.run(job, self._render)
+        def done(member):
+            self._render(member)
+            # Perms may have changed (e.g. delete-messages just granted): let the
+            # backfill scheduler re-evaluate this chat instead of staying blocked.
+            self.main.clear_backfill_block(bot_id, chat)
+
+        self.main.run_call(job, done, button=self.refresh_btn, on_error=self._show_error)
+
+    def _show_error(self, msg: str) -> None:
+        self._clear_card()
+        self.card.setVisible(True)
+        lab = QLabel(f"Could not read the bot's rights: {msg}")
+        lab.setStyleSheet(f"color:{DANGER};"); lab.setWordWrap(True)
+        self.card_lay.addWidget(lab)
 
     def _clear_card(self) -> None:
         while self.card_lay.count():
@@ -637,9 +493,12 @@ class RightsPage(BasePage):
             f"font-size:20px; font-weight:600;")
         name_box = QVBoxLayout(); name_box.setSpacing(0)
         nlab = QLabel(name); nlab.setStyleSheet("font-size:16px; font-weight:600;")
-        sub = QLabel("has access to messages" if is_admin else f"status: {status}")
+        sub = QLabel(f"status: {status}")
         sub.setStyleSheet(f"color:{SUCCESS if is_admin else TEXT_MUTED};")
-        name_box.addWidget(nlab); name_box.addWidget(sub)
+        from datetime import datetime
+        checked = QLabel(f"read live at {datetime.now().strftime('%H:%M:%S')}")
+        checked.setObjectName("Muted")
+        name_box.addWidget(nlab); name_box.addWidget(sub); name_box.addWidget(checked)
         header.addWidget(avatar); header.addSpacing(12); header.addLayout(name_box); header.addStretch(1)
         hw = QWidget(); hw.setStyleSheet("background:transparent;"); hw.setLayout(header)
         self.card_lay.addWidget(hw)
@@ -780,16 +639,21 @@ class InvitePage(BasePage):
         except ValueError as e:
             self._set_msg(str(e), error=True)
             return
-        self._set_msg("")
+        self._set_msg("Creating...", error=False)
         approval = self.join.isChecked()
         # Telegram forbids a member limit together with approval.
         limit = None if approval else (self.limit.value() or None)
-        self.run(lambda: api.create_chat_invite_link(
-            client, chat, name=self.name.text().strip() or None,
-            member_limit=limit, creates_join_request=approval),
+        self.main.run_call(
+            lambda: api.create_chat_invite_link(
+                client, chat, name=self.name.text().strip() or None,
+                member_limit=limit, creates_join_request=approval),
             lambda r: (self.link.setText(r.get("invite_link", "")),
                        self._set_msg("Invite link created.", error=False),
-                       self.main.log("[OK] Invite link created.")), btn)
+                       self.main.log("[OK] Invite link created.")),
+            button=btn,
+            on_error=lambda m: self._set_msg(
+                f"Failed: {m}. The bot needs the 'Invite users via link' admin right here.",
+                error=True))
 
 
 class ListenPage(BasePage):
@@ -1030,21 +894,6 @@ class ArchivePage(BasePage):
         self.main.log(f"[ERROR] {msg}")
 
 
-# --------------------------------------------------------------------------
-# Report dashboard (OSINT): load a dump, see links / senders / IOCs, drill in.
-# --------------------------------------------------------------------------
-
-# mode -> (title, indicator types, icon). "senders" is handled on its own.
-_REPORT_CARDS = [
-    ("links", "Links", intel.LINK_TYPES, "link"),
-    ("senders", "Senders", (), "users"),
-    ("crypto", "Crypto addresses", intel.CRYPTO_TYPES, "key"),
-    ("mentions", "Mentions", ("mention",), "user"),
-]
-_MODE_TYPES = {"links": intel.LINK_TYPES, "crypto": intel.CRYPTO_TYPES,
-               "mentions": ("mention",)}
-
-
 class Collapsible(QWidget):
     """A Splunk-style drill-down row: a clickable header (chevron + title, the
     title usually carries a count) over a body that is built lazily the first
@@ -1085,450 +934,6 @@ class Collapsible(QWidget):
             self._built = True
         self._body.setVisible(on)
 
-
-class ReportPage(BasePage):
-    title = "Report"
-    fill = True
-    subtitle = ("Open a saved archive and explore it: the links, people and crypto addresses that appear, "
-                "and when. Click anything to see more detail.")
-
-    def build(self) -> None:
-        self.index: Optional[intel.Index] = None
-        self._source = ""
-        self._loaded_for = None
-        self.messages: list = []
-
-        top = QHBoxLayout(); top.setSpacing(10)
-        # The collected messages ARE the data (the local store is the DB), so
-        # there's no "load external file" - the report always reads the store.
-        self.loaded = QLabel("Nothing collected yet."); self.loaded.setObjectName("Muted")
-        self.export_btn = build_export_button(self, self._overview_datasets(), log=self.main.log)
-        self.export_btn.setEnabled(False)
-        top.addWidget(self.loaded, 1); top.addWidget(self.export_btn)
-        self.root.addLayout(top)
-
-        self.inner = QStackedWidget()
-        self.inner.addWidget(self._build_overview())   # index 0
-        self.detail_host = QWidget()
-        self.detail_host_lay = QVBoxLayout(self.detail_host)
-        self.detail_host_lay.setContentsMargins(0, 0, 0, 0)
-        self.inner.addWidget(self.detail_host)          # index 1
-        self.root.addWidget(self.inner, 1)
-        self._init_empty(self.loaded, self.export_btn, self.inner)
-
-    # ---- overview ----
-    def _build_overview(self) -> QWidget:
-        scroll = QScrollArea(); scroll.setWidgetResizable(True); scroll.setFrameShape(QFrame.Shape.NoFrame)
-        host = QWidget(); lay = QVBoxLayout(host); lay.setContentsMargins(0, 0, 0, 0); lay.setSpacing(14)
-
-        self.tiles_row = QHBoxLayout(); self.tiles_row.setSpacing(10)
-        self._tiles = {}
-        for key, label in [("messages", "Messages"), ("senders", "Senders"),
-                           ("links", "Links"), ("crypto", "Crypto"),
-                           ("phone", "Phones"), ("media", "Media")]:
-            t = stat_tile(label, "-"); self._tiles[key] = t
-            self.tiles_row.addWidget(t)
-        lay.addLayout(self.tiles_row)
-
-        grid = QGridLayout(); grid.setSpacing(12)
-        self._cards = {}
-        for i, (mode, title, types, icon_name) in enumerate(_REPORT_CARDS):
-            card, bars = self._category_card(mode, title, icon_name)
-            self._cards[mode] = bars
-            grid.addWidget(card, i // 2, i % 2)
-        lay.addLayout(grid)
-        lay.addStretch(1)
-        scroll.setWidget(host)
-        return scroll
-
-    def _category_card(self, mode, title, icon_name):
-        card = QFrame(); card.setObjectName("Card")
-        lay = QVBoxLayout(card); lay.setContentsMargins(16, 14, 16, 14); lay.setSpacing(8)
-        head = QHBoxLayout()
-        ic = QLabel(); ic.setPixmap(make_icon(icon_name, TEXT, 16).pixmap(16, 16))
-        t = QLabel(title); t.setStyleSheet("font-weight:600; font-size:14px;")
-        more = icon_button("Details", "chart")
-        more.clicked.connect(lambda _, m=mode: self._open_detail(m, None))
-        head.addWidget(ic); head.addSpacing(6); head.addWidget(t); head.addStretch(1); head.addWidget(more)
-        lay.addLayout(head)
-        bars = HBarList()
-        bars.setFixedHeight(186)   # room for ~6 rows; cards must not collapse
-        bars.clicked.connect(lambda value, m=mode: self._open_detail(m, value))
-        lay.addWidget(bars)
-        return card, bars
-
-    # ---- dynamic: analyse the collected messages on its own ----
-    def on_shown(self) -> None:
-        if not self._apply_empty_state():
-            return
-        key = (self.session.bot_id, self.session.chat)
-        if self._loaded_for != key:
-            self._load_collected()
-
-    def clear_view(self) -> None:
-        self._loaded_for = None
-        self.index = None
-        self.messages = []
-        self._source = ""
-        self.loaded.setText("Nothing collected yet.")
-        self.export_btn.setEnabled(False)
-        for t in self._tiles.values():
-            t._value.setText("-")
-        for bars in self._cards.values():
-            bars.set_rows([])
-        self.inner.setCurrentIndex(0)
-        self._apply_empty_state()
-
-    def _collected_messages(self) -> list:
-        bot_id = self.session.bot_id
-        if self.session.chat is not None:
-            return store.load_messages_for(bot_id, self.session.chat)
-        path = store.messages_path(bot_id)
-        return intel.load_messages(path) if os.path.exists(path) else []
-
-    def _load_collected(self) -> None:
-        bot_id = self.session.bot_id
-        if bot_id is None:
-            return
-        self._loaded_for = (bot_id, self.session.chat)
-        where = f"chat {self.session.chat}" if self.session.chat is not None else "all chats"
-        try:
-            self.messages = self._collected_messages()
-            self.index = intel.scan_messages(self.messages)
-        except Exception as exc:
-            self.main.log(f"[ERROR] Could not analyse collected messages: {exc}")
-            self.clear_view()
-            return
-        if not self.messages:
-            self.clear_view()
-            self.loaded.setText("Nothing collected yet - messages are archived as the bot sees them.")
-            return
-        self._source = f"collected ({where})"
-        self._show_loaded()
-
-    def _show_loaded(self) -> None:
-        self.export_btn.setEnabled(True)
-        try:
-            self._refresh_overview()
-        except Exception as exc:
-            self.main.log(f"[ERROR] Could not render the report: {exc}")
-            return
-        self.inner.setCurrentIndex(0)
-        self.main.log(f"[OK] {self.index.messages} messages analysed ({self._source}).")
-
-    def _refresh_overview(self) -> None:
-        idx = self.index
-        span = ""
-        if idx.date_min and idx.date_max:
-            from datetime import datetime, timezone
-            fmt = "%Y-%m-%d"
-            span = (f"  ·  {datetime.fromtimestamp(idx.date_min, timezone.utc).strftime(fmt)} "
-                    f"-> {datetime.fromtimestamp(idx.date_max, timezone.utc).strftime(fmt)}")
-        self.loaded.setText(f"{os.path.basename(self._source)}  ·  {idx.messages} messages{span}")
-        totals = idx.type_totals()
-        vals = {
-            "messages": idx.messages, "senders": len(idx.senders),
-            "links": sum(totals.get(t, 0) for t in intel.LINK_TYPES),
-            "crypto": sum(totals.get(t, 0) for t in intel.CRYPTO_TYPES),
-            "phone": totals.get("phone", 0), "media": idx.media_count,
-        }
-        for k, v in vals.items():
-            self._tiles[k]._value.setText(str(v))
-        for mode, bars in self._cards.items():
-            bars.set_rows(self._top_rows(mode, 6))
-
-    def _top_rows(self, mode, n):
-        idx = self.index
-        if idx is None:
-            return []
-        if mode == "senders":
-            return [(s.label, s.label, "", s.count) for s in idx.top_senders(n)]
-        rows = idx.top_values(_MODE_TYPES[mode], n)
-        return [(value, value, kind, count) for value, kind, count in rows]
-
-    # ---- detail drill-down ----
-    def _open_detail(self, mode, value) -> None:
-        if self.index is None:
-            return
-        while self.detail_host_lay.count():
-            w = self.detail_host_lay.takeAt(0).widget()
-            if w:
-                w.deleteLater()
-
-        header = QHBoxLayout()
-        back = icon_button("Back", "back"); back.clicked.connect(lambda: self.inner.setCurrentIndex(0))
-        title = QLabel(("Senders" if mode == "senders" else dict((m, t) for m, t, *_ in _REPORT_CARDS)[mode]))
-        title.setStyleSheet("font-weight:600; font-size:15px;")
-        header.addWidget(back); header.addSpacing(8); header.addWidget(title); header.addStretch(1)
-        hw = QWidget(); hw.setLayout(header); self.detail_host_lay.addWidget(hw)
-
-        all_rows = self._top_rows(mode, 40)
-        if not all_rows:
-            # Nothing for this category: just a single hint, no list, no panel.
-            note = QLabel("No data yet"); note.setObjectName("Muted")
-            note.setAlignment(Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignHCenter)
-            self.detail_host_lay.addWidget(note, 1)
-            self.inner.setCurrentIndex(1)
-            return
-
-        body = QHBoxLayout(); body.setSpacing(14)
-        # left: full ranked list of items in this mode
-        left = QFrame(); left.setObjectName("Card"); left.setMaximumWidth(330)
-        ll = QVBoxLayout(left); ll.setContentsMargins(12, 12, 12, 12)
-        ll.addWidget(QLabel("All items" if mode != "senders" else "All senders"))
-        self._detail_list = HBarList(row_height=28)
-        self._detail_list.set_rows(all_rows)
-        self._detail_list.clicked.connect(lambda v, m=mode: self._show_item(m, v))
-        lscroll = QScrollArea(); lscroll.setWidgetResizable(True); lscroll.setFrameShape(QFrame.Shape.NoFrame)
-        lscroll.setWidget(self._detail_list)
-        ll.addWidget(lscroll)
-        body.addWidget(left)
-
-        # right: the selected item's panel
-        self._detail_right = QVBoxLayout()
-        rightw = QWidget(); rightw.setLayout(self._detail_right)
-        body.addWidget(rightw, 1)
-        bw = QWidget(); bw.setLayout(body); self.detail_host_lay.addWidget(bw, 1)
-
-        self._show_item(mode, value if value is not None else all_rows[0][0])
-        self.inner.setCurrentIndex(1)
-
-    def _show_item(self, mode, value) -> None:
-        while self._detail_right.count():
-            w = self._detail_right.takeAt(0).widget()
-            if w:
-                w.deleteLater()
-        if value is None:
-            return
-        panel = (self._sender_panel(value) if mode == "senders"
-                 else self._indicator_panel(mode, value))
-        self._detail_right.addWidget(panel)
-
-    def _occ_for(self, mode, value):
-        occ = []
-        for t in _MODE_TYPES[mode]:
-            occ += self.index.occurrences(t, value)
-        return occ
-
-    def _indicator_panel(self, mode, value) -> QWidget:
-        from collections import Counter
-        occ = self._occ_for(mode, value)
-        card = QFrame(); card.setObjectName("Card")
-        lay = QVBoxLayout(card); lay.setContentsMargins(16, 14, 16, 14); lay.setSpacing(3)
-        head = QLabel(value); head.setStyleSheet("font-weight:600; font-size:15px;"); head.setWordWrap(True)
-        head.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
-        lay.addWidget(head)
-        sub = QLabel(f"{len(occ)} occurrences  ·  {len({o.sender for o in occ})} sender(s)")
-        sub.setObjectName("Muted"); lay.addWidget(sub)
-        lay.addSpacing(4)
-        lay.addWidget(Collapsible("Over time",
-                                  lambda: self._tb(intel.time_buckets([o.date for o in occ])), open=True))
-        by = Counter(o.sender for o in occ)
-        lay.addWidget(Collapsible(f"Posted by ({len(by)})",
-                                  lambda: self._bar(by.most_common(15))))
-        lay.addWidget(Collapsible(f"Messages ({len(occ)})",
-                                  lambda: self._messages_table(occ)))
-        lay.addWidget(self._item_export_button(value, occ), 0, Qt.AlignmentFlag.AlignLeft)
-        lay.addStretch(1)
-        scroll = QScrollArea(); scroll.setWidgetResizable(True)
-        scroll.setFrameShape(QFrame.Shape.NoFrame); scroll.setWidget(card)
-        return scroll
-
-    # Indicator types grouped for the per-sender profile, with honest labels.
-    _SENDER_IOC_GROUPS = [
-        ("Links & addresses shared", ("url", "telegram_invite", "email", "btc", "eth", "ton")),
-        ("@mentions used", ("mention",)),
-        ("Possible phone numbers", ("phone",)),   # regex is loose, so: "possible"
-    ]
-
-    def _sender_panel(self, label) -> QWidget:
-        from datetime import datetime, timezone
-        st = self.index.senders.get(label)
-        rows = intel.sender_texts(self.messages, label)   # (date, mid, text), oldest first
-        texts = [t for _, _, t in rows]
-        dates = [d for d, _, _ in rows if d]
-
-        card = QFrame(); card.setObjectName("Card")
-        lay = QVBoxLayout(card); lay.setContentsMargins(16, 14, 16, 14); lay.setSpacing(3)
-        head = QLabel(label); head.setStyleSheet("font-weight:600; font-size:15px;")
-        head.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
-        lay.addWidget(head)
-
-        # One honest summary line: volume, span, how many distinct days, size.
-        n = st.count if st else len(texts)
-        bits = [f"{n} text messages"]
-        if dates:
-            d0 = datetime.fromtimestamp(min(dates), timezone.utc).strftime("%Y-%m-%d")
-            d1 = datetime.fromtimestamp(max(dates), timezone.utc).strftime("%Y-%m-%d")
-            days = len({datetime.fromtimestamp(d, timezone.utc).date() for d in dates})
-            bits.append(f"{d0} -> {d1}")
-            bits.append(f"{days} active day(s)")
-        if texts:
-            bits.append(f"~{sum(len(t) for t in texts) // max(len(texts), 1)} chars/msg")
-        sub = QLabel("  ·  ".join(bits)); sub.setObjectName("Muted"); sub.setWordWrap(True)
-        lay.addWidget(sub)
-
-        # Headline figures stay sober; everything else is one click away.
-        shared = sum(len(v) for t, v in self._sender_indicators(label).items())
-        chips = QLabel(f"{shared} indicator(s) shared  ·  click a section below to dig in")
-        chips.setObjectName("Muted"); lay.addWidget(chips)
-        lay.addSpacing(4)
-
-        # The one default visual: when did they talk.
-        lay.addWidget(Collapsible("Activity over time",
-                                  lambda: self._tb(intel.time_buckets(dates)), open=True))
-        lay.addWidget(Collapsible("Active hours (UTC) - quiet hours hint at a timezone",
-                                  lambda: self._tb([(f"{h:02d}", c)
-                                                    for h, c in intel.hour_histogram(dates)], 120)))
-        words = intel.word_frequencies(texts, 15)
-        lay.addWidget(Collapsible(f"Most-used words ({len(words)})",
-                                  lambda: self._bar([(w, c) for w, c in words]) if words
-                                  else self._muted("Not enough text to rank words.")))
-
-        posted = self._sender_indicators(label)
-        for title, types in self._SENDER_IOC_GROUPS:
-            group = sorted(((v, c) for t in types for v, c in posted.get(t, [])),
-                           key=lambda r: -r[1])
-            if group:
-                lay.addWidget(Collapsible(f"{title} ({len(group)})",
-                                          lambda g=group: self._bar(g[:15])))
-        lay.addWidget(Collapsible(f"Their messages ({len(rows)})",
-                                  lambda: self._sender_messages_table(rows)))
-        lay.addWidget(self._sender_export_button(label, rows), 0, Qt.AlignmentFlag.AlignLeft)
-        lay.addStretch(1)
-
-        # Tall profile: let it scroll inside the detail area.
-        scroll = QScrollArea(); scroll.setWidgetResizable(True)
-        scroll.setFrameShape(QFrame.Shape.NoFrame); scroll.setWidget(card)
-        return scroll
-
-    def _tb(self, buckets, minh=None) -> TimeBars:
-        tb = TimeBars()
-        if minh:
-            tb.setMinimumHeight(minh)
-        tb.set_buckets(buckets)
-        return tb
-
-    def _sender_indicators(self, label) -> dict:
-        from collections import defaultdict
-        out = defaultdict(list)
-        for t, values in self.index.indicators.items():
-            for value, occ in values.items():
-                c = sum(1 for o in occ if o.sender == label)
-                if c:
-                    out[t].append((value, c))
-        return out
-
-    def _bar(self, rows) -> HBarList:
-        b = HBarList(row_height=24)
-        b.set_rows([(v, v, "", c) for v, c in rows])
-        b.setFixedHeight(24 * max(len(rows), 1) + 4)
-        return b
-
-    def _muted(self, text) -> QLabel:
-        l = QLabel(text); l.setObjectName("Muted"); l.setWordWrap(True)
-        return l
-
-    def _sender_messages_table(self, rows) -> QTableWidget:
-        from datetime import datetime, timezone
-        table = QTableWidget(0, 2)
-        table.setHorizontalHeaderLabels(["Date", "Message"])
-        table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
-        table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
-        table.verticalHeader().setVisible(False); table.setShowGrid(False)
-        table.setWordWrap(True); table.setMaximumHeight(240)
-        for date, _mid, text in rows[-300:][::-1]:   # newest first
-            r = table.rowCount(); table.insertRow(r)
-            d = datetime.fromtimestamp(date, timezone.utc).strftime("%Y-%m-%d %H:%M") if date else ""
-            table.setItem(r, 0, QTableWidgetItem(d))
-            table.setItem(r, 1, QTableWidgetItem(text))
-        return table
-
-    def _sender_export_button(self, label, rows):
-        from datetime import datetime, timezone
-
-        def data():
-            out = []
-            for date, mid, text in rows:
-                iso = datetime.fromtimestamp(date, timezone.utc).isoformat() if date else ""
-                out.append([mid, iso, text])
-            return ["message_id", "date", "text"], out
-
-        safe = re.sub(r"[^\w.-]+", "_", label).strip("_") or "sender"
-        return build_export_button(self, [("This sender's messages", f"sender_{safe}", data)],
-                                   log=self.main.log)
-
-    def _section(self, text) -> QLabel:
-        l = QLabel(text); l.setStyleSheet(f"color:{ACCENT}; padding-top:4px; font-size:12px;")
-        return l
-
-    def _messages_table(self, occ) -> QTableWidget:
-        from datetime import datetime, timezone
-        table = QTableWidget(0, 3)
-        table.setHorizontalHeaderLabels(["Msg", "Date", "Text"])
-        table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
-        table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
-        table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
-        table.verticalHeader().setVisible(False); table.setShowGrid(False)
-        table.setMaximumHeight(200)
-        for o in occ[:200]:
-            r = table.rowCount(); table.insertRow(r)
-            d = (datetime.fromtimestamp(o.date, timezone.utc).strftime("%Y-%m-%d %H:%M")
-                 if o.date else "")
-            for c, v in enumerate([str(o.message_id), d, o.text]):
-                table.setItem(r, c, QTableWidgetItem(v))
-        return table
-
-    # ---- export datasets (one Export button, choose what + CSV/JSON) ----
-    def _overview_datasets(self):
-        from datetime import datetime, timezone
-
-        def iso(ts):
-            return datetime.fromtimestamp(ts, timezone.utc).isoformat() if ts else ""
-
-        def messages():
-            rows = [[m.get("message_id"), iso(intel._msg_date(m)),
-                     intel._sender_label(m), m.get("text") or m.get("caption") or ""]
-                    for m in self.messages]
-            return ["message_id", "date", "sender", "text"], rows
-
-        def senders():
-            rows = [[s.label, s.count, ", ".join(f"{k}:{v}" for k, v in s.types.items())]
-                    for s in (self.index.top_senders() if self.index else [])]
-            return ["sender", "messages", "indicators"], rows
-
-        def links():
-            rows = [[v, t, c] for v, t, c in
-                    (self.index.top_values(intel.LINK_TYPES) if self.index else [])]
-            return ["link", "type", "count"], rows
-
-        def indicators():
-            rows = []
-            if self.index:
-                for t, values in self.index.indicators.items():
-                    for value, occ in values.items():
-                        rows.append([t, value, len(occ)])
-            return ["type", "value", "count"], rows
-
-        return [
-            ("Messages", "messages", messages),
-            ("Members / senders", "senders", senders),
-            ("Links", "links", links),
-            ("All indicators", "indicators", indicators),
-        ]
-
-    def _item_export_button(self, value, occ):
-        from datetime import datetime, timezone
-
-        def provider():
-            rows = [[o.message_id,
-                     datetime.fromtimestamp(o.date, timezone.utc).isoformat() if o.date else "",
-                     o.sender, o.text] for o in occ]
-            return ["message_id", "date", "sender", "text"], rows
-
-        safe = "".join(c for c in value[:24] if c.isalnum() or c in "-_") or "item"
-        return build_export_button(self, [("Occurrences", f"occ_{safe}", provider)],
-                                   log=self.main.log, label="Export")
 
 
 # --------------------------------------------------------------------------
@@ -1625,9 +1030,11 @@ class ConversationPage(BasePage):
             self._set_can_send(False, "Connect to a chat to send")
             return
         self._set_can_send(False, "Checking if the bot can post here...")
-        self.run(lambda: api.bot_send_right(client, chat),
-                 lambda ok: self._set_can_send(bool(ok),
-                                               "" if ok else "No rights to send messages here"))
+        self.main.run_call(
+            lambda: api.bot_send_right(client, chat),
+            lambda ok: self._set_can_send(bool(ok),
+                                          "" if ok else "No rights to send messages here"),
+            on_error=lambda m: self._set_can_send(False, f"Couldn't check rights ({m})"))
 
     def _send(self) -> None:
         if not self._can_send:
@@ -1651,8 +1058,14 @@ class ConversationPage(BasePage):
                             "first_name": self.session.bot_username or "this bot"}}
             store.append_messages(bot_id, [msg])
             self.add_message(msg)
+            self.main.log(f"[OK] Sent message {res.get('message_id')} to chat {chat}.")
 
-        self.run(lambda: api.send_message(client, chat, text), done, self.send_btn)
+        def failed(m):
+            self.msg_in.setText(text)   # don't lose what you typed
+            self.main.log(f"[ERROR] Send failed: {m}")
+
+        self.main.run_call(lambda: api.send_message(client, chat, text), done,
+                           button=self.send_btn, on_error=failed)
 
     def on_hidden(self) -> None:
         # Losing focus only drops priority: the walk may keep going if it still
@@ -1691,20 +1104,81 @@ class ConversationPage(BasePage):
             if w:
                 w.deleteLater()
         limit = self.main.settings.get("conversation_limit", 500)
-        ordered = [self._msgs[k] for k in sorted(self._msgs)][-limit:]
+        # Order by TIME, not message id: after a group -> supergroup upgrade (and
+        # between live vs backfilled messages) ids no longer track time, so id
+        # order scrambled the timeline. Dateless messages fall to the end.
+        from datetime import datetime
+
+        def sort_key(m):
+            d = m.get("date")
+            mid = m.get("message_id") or 0
+            return (0, d, mid) if d is not None else (1, 0, mid)
+
+        ordered = sorted(self._msgs.values(), key=sort_key)[-limit:]
         last_sender = None
+        last_day = None
         for msg in ordered:
+            d = msg.get("date")
+            if d is not None:
+                day = datetime.fromtimestamp(d).date()   # local day
+                if day != last_day:
+                    self.col.insertWidget(self.col.count() - 1,
+                                          self._date_separator(datetime.fromtimestamp(d)))
+                    last_day = day
+                    last_sender = None   # re-show the name after a date break
             sender = msg.get("from") or {}
             key = sender.get("id") or sender.get("username") or sender.get("first_name")
             self.col.insertWidget(self.col.count() - 1,
                                   self._bubble_row(msg, show_name=(key != last_sender)))
             last_sender = key
         if scroll_bottom:
-            QTimer.singleShot(0, lambda: self.scroll.verticalScrollBar().setValue(
-                self.scroll.verticalScrollBar().maximum()))
+            self._pin_to_bottom()
+
+    def _pin_to_bottom(self) -> None:
+        """Scroll to the newest message. Word-wrapped bubbles get their final
+        height over a couple of layout passes, so a single scroll stops short -
+        we re-pin on each range change until the content stops growing."""
+        sb = self.scroll.verticalScrollBar()
+
+        def go():
+            try:
+                sb.setValue(sb.maximum())
+            except RuntimeError:
+                pass   # widget gone (e.g. a theme rebuild) - ignore
+        go()
+        # rangeChanged fires as bubbles settle; re-pin, then stop listening.
+        try:
+            sb.rangeChanged.disconnect(self._on_scroll_range)
+        except TypeError:
+            pass
+        sb.rangeChanged.connect(self._on_scroll_range)
+        QTimer.singleShot(0, go)
+        QTimer.singleShot(60, go)
+        QTimer.singleShot(180, lambda: (go(), self._stop_pin()))
+
+    def _on_scroll_range(self, _min, _max) -> None:
+        try:
+            self.scroll.verticalScrollBar().setValue(_max)
+        except RuntimeError:
+            pass
+
+    def _stop_pin(self) -> None:
+        try:
+            self.scroll.verticalScrollBar().rangeChanged.disconnect(self._on_scroll_range)
+        except (TypeError, RuntimeError):
+            pass
+
+    def _date_separator(self, dt) -> QWidget:
+        lab = QLabel(dt.strftime("%d %B %Y"))
+        lab.setStyleSheet(f"color:{TEXT_MUTED}; background:{SYS_PILL}; border-radius:10px; "
+                          "padding:3px 12px; font-size:11px;")
+        row = QWidget(); row.setStyleSheet("background:transparent;")
+        rl = QHBoxLayout(row); rl.setContentsMargins(0, 8, 0, 2)
+        rl.addStretch(1); rl.addWidget(lab); rl.addStretch(1)
+        return row
 
     def _bubble_row(self, msg: dict, show_name: bool) -> QWidget:
-        from datetime import datetime, timezone
+        from datetime import datetime
         if msg.get("_system"):
             lab = QLabel(msg.get("text", ""))
             lab.setStyleSheet(
@@ -1732,9 +1206,9 @@ class ConversationPage(BasePage):
         # Time bottom-right, compact (HH:MM), full date on hover - like Telegram.
         date = msg.get("date")
         if date:
-            dt = datetime.fromtimestamp(date, timezone.utc)
+            dt = datetime.fromtimestamp(date)   # local time, so it matches Telegram
             tl = QLabel(dt.strftime("%H:%M"))
-            tl.setToolTip(dt.strftime("%Y-%m-%d %H:%M UTC"))
+            tl.setToolTip(dt.strftime("%Y-%m-%d %H:%M"))
         else:
             tl = QLabel("")
         tl.setStyleSheet(f"color:{TEXT_MUTED}; font-size:10px;")
@@ -1771,16 +1245,20 @@ class ConversationPage(BasePage):
         QApplication.clipboard().setText(text or "")
 
     def _copy_all(self) -> None:
-        from datetime import datetime, timezone
+        from datetime import datetime
         lines = []
-        for mid in sorted(self._msgs):
-            m = self._msgs[mid]
+
+        def sort_key(m):
+            d = m.get("date"); mid = m.get("message_id") or 0
+            return (0, d, mid) if d is not None else (1, 0, mid)
+
+        for m in sorted(self._msgs.values(), key=sort_key):   # chronological, like the view
             if m.get("_system"):
                 lines.append(m.get("text", "")); continue
             s = m.get("from") or {}
             who = ("@" + s["username"]) if s.get("username") else (s.get("first_name") or "unknown")
             d = m.get("date")
-            ts = datetime.fromtimestamp(d, timezone.utc).strftime("%Y-%m-%d %H:%M") if d else ""
+            ts = datetime.fromtimestamp(d).strftime("%Y-%m-%d %H:%M") if d else ""
             lines.append(f"[{ts}] {who}: {m.get('text','')}")
         QApplication.clipboard().setText("\n".join(lines))
         self.main.log(f"[OK] Copied {len(lines)} messages to the clipboard.")
@@ -1817,11 +1295,770 @@ class ConversationPage(BasePage):
 # Main window
 # --------------------------------------------------------------------------
 
+# --------------------------------------------------------------------------
+# Investigator / Nexus / Keys - the cross-bot, graph-backed workspaces.
+# --------------------------------------------------------------------------
+
+Subject = enrich.Subject
+
+
+def _parse_subject(raw: str):
+    """A '@handle', 'handle', or numeric id typed by the user -> a Subject."""
+    raw = raw.strip()
+    if not raw:
+        return None
+    if raw.lstrip("-").isdigit():
+        return Subject(user_id=int(raw), label=f"id {raw}")
+    return Subject(username=raw.lstrip("@"), label="@" + raw.lstrip("@"))
+
+
+def make_bars(items, height: int = 24, on_click=None) -> HBarList:
+    """items: list of (key, label, sub, value). Fixed height so it shows in a
+    scroll/collapsible; `on_click(key)` wired to row clicks when given."""
+    b = HBarList(row_height=height)
+    b.set_rows(list(items))
+    b.setFixedHeight(height * max(len(items), 1) + 4)
+    if on_click is not None:
+        b.clicked.connect(on_click)
+    return b
+
+
+_IND_LABELS = {"url": "Links", "telegram_invite": "Invite links", "email": "Emails",
+               "btc": "BTC", "eth": "ETH", "ton": "TON", "mention": "@mentions",
+               "phone": "Phones"}
+
+# Short button labels / icons per enrichment provider name.
+_PROV_LABEL = {"dorks": "Web leads", "t.me": "t.me", "tgstat": "TGStat", "telethon": "Telethon"}
+_PROV_ICON = {"dorks": "search", "t.me": "message", "tgstat": "chart", "telethon": "key"}
+
+
+class CredentialsPage(BasePage):
+    title = "Keys"
+    subtitle = "Optional credentials for deeper enrichment - stored locally only."
+
+    def build(self) -> None:
+        self._login_worker = None
+        body = QWidget()
+        outer = QVBoxLayout(body); outer.setContentsMargins(0, 0, 0, 0); outer.setSpacing(12)
+        intro = QLabel("Experimental. These third-party / account integrations may be "
+                       "rate-limited, change, or need a paid tier. Credentials are stored "
+                       "locally in ~/.telegram_tools/credentials.json (gitignored) and only "
+                       "ever sent to Telegram / the provider you use. No-account enrichment "
+                       "(web leads, t.me) needs nothing here.")
+        intro.setObjectName("Muted"); intro.setWordWrap(True)
+        outer.addWidget(intro)
+
+        c = creds.load_credentials()
+        card = QFrame(); card.setObjectName("Card")
+        cl = QVBoxLayout(card); cl.setContentsMargins(16, 14, 16, 14); cl.setSpacing(10)
+        t = QLabel("Telethon (your Telegram account) · experimental"); t.setStyleSheet("font-weight:600;")
+        cl.addWidget(t)
+        cl.addWidget(self._muted("api_id / api_hash come from https://my.telegram.org. "
+                                 "Logging in unlocks common-groups, member lists and real ids."))
+        self.api_id = QLineEdit(c.get("tg_api_id", "")); self.api_id.setPlaceholderText("e.g. 2040295")
+        self.api_hash = QLineEdit(c.get("tg_api_hash", ""))
+        self.api_hash.setPlaceholderText("32-character hash from my.telegram.org")
+        self.phone = QLineEdit(c.get("tg_phone", "")); self.phone.setPlaceholderText("+33612345678")
+        row = QHBoxLayout(); row.setSpacing(10)
+        row.addWidget(field("API ID", self.api_id))
+        row.addWidget(field("API hash", self.api_hash), 1)
+        row.addWidget(field("Phone (country code)", self.phone))
+        cl.addLayout(row)
+        btns = QHBoxLayout()
+        self.login_btn = icon_button("Log in to Telegram", "key", primary=True)
+        self.login_btn.clicked.connect(self._login)
+        self.login_status = QLabel(""); self.login_status.setObjectName("Muted")
+        btns.addWidget(self.login_btn); btns.addWidget(self.login_status, 1)
+        cl.addLayout(btns)
+        outer.addWidget(card)
+
+        card2 = QFrame(); card2.setObjectName("Card")
+        c2 = QVBoxLayout(card2); c2.setContentsMargins(16, 14, 16, 14); c2.setSpacing(10)
+        t2 = QLabel("Provider API keys (optional) · experimental"); t2.setStyleSheet("font-weight:600;")
+        c2.addWidget(t2)
+        self.tgstat = QLineEdit(c.get("tgstat_key", ""))
+        self.tgstat.setPlaceholderText("paste your token from tgstat.ru")
+        c2.addWidget(field("TGStat API token", self.tgstat))
+        outer.addWidget(card2)
+
+        save = icon_button("Save", "check"); save.clicked.connect(self._save)
+        self.save_msg = QLabel(""); self.save_msg.setObjectName("Muted")
+        sr = QHBoxLayout(); sr.addWidget(save); sr.addWidget(self.save_msg, 1)
+        outer.addLayout(sr)
+        outer.addStretch(1)
+        self.root.addWidget(body)
+        self._refresh_status()
+
+    def _muted(self, text):
+        lab = QLabel(text); lab.setObjectName("Muted"); lab.setWordWrap(True); return lab
+
+    def _save(self) -> None:
+        creds.save_credentials({
+            "tg_api_id": self.api_id.text().strip(), "tg_api_hash": self.api_hash.text().strip(),
+            "tg_phone": self.phone.text().strip(), "tgstat_key": self.tgstat.text().strip()})
+        self.save_msg.setText("Saved.")
+        self._refresh_status()
+
+    def _refresh_status(self) -> None:
+        if creds.has_telethon_creds():
+            self.login_status.setText("Credentials set. Click to log in (or re-use the saved session).")
+        else:
+            self.login_status.setText("Enter api_id / api_hash, Save, then log in.")
+
+    def _login(self) -> None:
+        self._save()
+        api_id, api_hash, phone = (self.api_id.text().strip(), self.api_hash.text().strip(),
+                                   self.phone.text().strip())
+        if not (api_id and api_hash and phone):
+            self.login_status.setText("Need api_id, api_hash and phone to log in.")
+            return
+        self.login_btn.setEnabled(False)
+        self.login_status.setText("Connecting to Telegram...")
+        w = TelethonLoginWorker(api_id, api_hash, phone, creds.SESSION)
+        self._login_worker = w
+        self.main._track(w)
+        w.code_needed.connect(lambda: self._ask(w, "code"))
+        w.password_needed.connect(lambda: self._ask(w, "password"))
+        w.done.connect(self._login_ok)
+        w.failed.connect(self._login_err)
+        w.start()
+
+    def _ask(self, worker, what: str) -> None:
+        if what == "code":
+            text, ok = QInputDialog.getText(self, "Telegram code",
+                                            "Enter the login code Telegram just sent you:")
+            worker.provide_code(text if ok else "")
+        else:
+            text, ok = QInputDialog.getText(self, "Two-step password",
+                                            "Enter your 2FA password:", QLineEdit.EchoMode.Password)
+            worker.provide_password(text if ok else "")
+
+    def _login_ok(self, me: dict) -> None:
+        self.login_btn.setEnabled(True)
+        self.login_status.setText(f"Logged in as @{me.get('username') or me.get('id')}. "
+                                  "Telethon enrichment is now available.")
+        self.main.log(f"[OK] Telethon logged in as {me.get('id')}.")
+
+    def _login_err(self, msg: str) -> None:
+        self.login_btn.setEnabled(True)
+        self.login_status.setText(f"Login failed: {msg}")
+        self.main.log(f"[ERROR] Telethon login: {msg}")
+
+
+class InvestigatorPage(BasePage):
+    title = "Investigator"
+    fill = True
+    subtitle = ("Zoom on one subject across every bot's collected data, then enrich from "
+                "outside sources. The future of Member info.")
+
+    def build(self) -> None:
+        self._graph = None
+        self._umsgs = {}
+        self._subject_key = None
+        self._pending = None
+        self._enrich_worker = None
+
+        split = QSplitter(Qt.Orientation.Horizontal)
+        left = QFrame(); left.setObjectName("Card")
+        ll = QVBoxLayout(left); ll.setContentsMargins(12, 12, 12, 12); ll.setSpacing(8)
+        top = QHBoxLayout(); top.setSpacing(6)
+        self.sources_btn = self.main.sources_button(self._on_sources_changed)
+        ov = icon_button("Overview", "chart"); ov.clicked.connect(self._show_overview)
+        top.addWidget(self.sources_btn); top.addWidget(ov); top.addStretch(1)
+        ll.addLayout(top)
+        self.search = QLineEdit()
+        self.search.setPlaceholderText("Filter, or paste @handle / id + Enter")
+        self.search.returnPressed.connect(self._manual_subject)
+        self._filter_timer = QTimer(self); self._filter_timer.setSingleShot(True)
+        self._filter_timer.timeout.connect(self._fill_list)
+        self.search.textChanged.connect(lambda: self._filter_timer.start(250))
+        ll.addWidget(self.search)
+        self.subjects = QListWidget()
+        self.subjects.itemClicked.connect(
+            lambda it: self._open_key(it.data(Qt.ItemDataRole.UserRole)))
+        ll.addWidget(self.subjects, 1)
+        split.addWidget(left)
+
+        self.dossier_host = QWidget()
+        self.dossier_lay = QVBoxLayout(self.dossier_host)
+        self.dossier_lay.setContentsMargins(0, 0, 0, 0)
+        rs = QScrollArea(); rs.setWidgetResizable(True); rs.setFrameShape(QFrame.Shape.NoFrame)
+        rs.setWidget(self.dossier_host)
+        split.addWidget(rs)
+        split.setStretchFactor(0, 0); split.setStretchFactor(1, 1); split.setSizes([300, 760])
+        self.root.addWidget(split, 1)
+        self._placeholder("Pick a subject on the left, or paste a @handle / id above.")
+
+    # ---- lifecycle ----
+    def on_shown(self) -> None:
+        self._graph, self._umsgs = self.main.get_graph()
+        self._fill_list()
+        if self._pending is not None:
+            key, self._pending = self._pending, None
+            self._open_key(key)
+        elif self._subject_key is None:
+            self._show_overview()
+
+    def _on_sources_changed(self) -> None:
+        self._graph, self._umsgs = self.main.get_graph()
+        self._subject_key = None
+        self._fill_list()
+        self._show_overview()
+
+    def _fill_list(self) -> None:
+        self.subjects.clear()
+        g = self._graph
+        if g is None:
+            return
+        users = sorted(g.entities_of(graph.USER), key=lambda e: -g.degree(e.key))
+        if not users:
+            return
+        q = self.search.text().strip().lower()
+        shown = 0
+        for e in users:
+            hay = f"{e.label} {e.attrs.get('username','')} {e.attrs.get('id','')}".lower()
+            if q and q not in hay:
+                continue
+            it = QListWidgetItem(f"{e.label}   ·   {g.degree(e.key)} links")
+            it.setData(Qt.ItemDataRole.UserRole, e.key)
+            self.subjects.addItem(it)
+            shown += 1
+            if shown >= 500:
+                break
+
+    def _manual_subject(self) -> None:
+        subj = _parse_subject(self.search.text())
+        if subj is None:
+            return
+        self._open_subject(subj, graph.user_key(subj.user_id, subj.handle()))
+
+    def _open_key(self, key) -> None:
+        if not key:
+            return
+        g = self._graph
+        ent = g.entities.get(key) if g else None
+        if ent is None:
+            self._open_subject(Subject(label=str(key)), key)
+        else:
+            self._open_subject(Subject(user_id=ent.attrs.get("id"),
+                                       username=ent.attrs.get("username"),
+                                       label=ent.label), key)
+
+    def open_pending(self, key) -> None:
+        """Called by the window (e.g. from Nexus) before navigating here."""
+        self._pending = key
+
+    # ---- dossier ----
+    def _placeholder(self, text) -> None:
+        self._clear_dossier()
+        lab = QLabel(text); lab.setObjectName("Muted"); lab.setWordWrap(True)
+        lab.setAlignment(Qt.AlignmentFlag.AlignTop)
+        self.dossier_lay.addWidget(lab); self.dossier_lay.addStretch(1)
+
+    def _clear_dossier(self) -> None:
+        while self.dossier_lay.count():
+            it = self.dossier_lay.takeAt(0)
+            w = it.widget()
+            if w:
+                w.deleteLater()
+
+    # ---- overview (the former Report, now graph-backed and cross-source) ----
+    def _show_overview(self) -> None:
+        self._subject_key = None
+        self._clear_dossier()
+        g = self._graph
+        if g is None or not g.entities:
+            if not self.main._selected_bots:
+                self._placeholder("No data yet - pick a source (bot) in 'Sources' above to "
+                                  "analyse its collected data.")
+            else:
+                self._placeholder("No data yet - the selected source hasn't collected messages.")
+            return
+        card = QFrame(); card.setObjectName("Card")
+        lay = QVBoxLayout(card); lay.setContentsMargins(16, 14, 16, 14); lay.setSpacing(4)
+        head = QLabel("Overview"); head.setStyleSheet("font-weight:600; font-size:16px;")
+        lay.addWidget(head)
+
+        users = g.entities_of(graph.USER); groups = g.entities_of(graph.GROUP)
+        inds = g.entities_of(graph.INDICATOR)
+        by_layer: dict = {}
+        for e in inds:
+            by_layer.setdefault(graph.entity_layer(e), []).append(e)
+        msgtotal = sum(len(m) for m in (self._umsgs or {}).values())
+        lay.addWidget(self._muted(
+            f"{msgtotal} messages  ·  {len(users)} people  ·  {len(groups)} groups  ·  "
+            f"{len(inds)} indicators  ·  {len(self.main._selected_bots)} source(s)"))
+        trow = QHBoxLayout(); trow.setSpacing(10)
+        for name, val in (("Messages", msgtotal), ("People", len(users)), ("Groups", len(groups)),
+                          ("Links", len(by_layer.get("links", []))),
+                          ("Crypto", len(by_layer.get("crypto", []))),
+                          ("@mentions", len(by_layer.get("mentions", [])))):
+            trow.addWidget(stat_tile(name, str(val)))
+        tw = QWidget(); tw.setLayout(trow); lay.addWidget(tw)
+
+        people_rows = sorted(users, key=lambda e: -len((self._umsgs or {}).get(e.key, [])))[:40]
+        lay.addWidget(Collapsible(f"Most active people ({len(users)})",
+            lambda r=people_rows: make_bars([(e.key, e.label, "", len((self._umsgs or {}).get(e.key, [])))
+                                             for e in r], on_click=self._open_key), open=True))
+        group_rows = sorted(groups, key=lambda e: -g.degree(e.key))[:40]
+        if group_rows:
+            lay.addWidget(Collapsible(f"Groups ({len(groups)})",
+                lambda r=group_rows: make_bars([(e.key, e.label, "", g.degree(e.key)) for e in r],
+                    on_click=lambda k: self.main.open_terrain(g.entities[k].attrs.get("chat_id")))))
+        for layer, label in (("links", "Top links"), ("crypto", "Top crypto"),
+                             ("invites", "Invite links"), ("mentions", "Top @mentions"),
+                             ("emails", "Emails"), ("phones", "Phones (possible)")):
+            items = sorted(by_layer.get(layer, []), key=lambda e: -g.degree(e.key))[:40]
+            if items:
+                lay.addWidget(Collapsible(f"{label} ({len(items)})",
+                    lambda r=items: make_bars([(e.key, e.label, "", g.degree(e.key)) for e in r],
+                        on_click=self._open_indicator)))
+        lay.addWidget(build_export_button(self, self._overview_datasets(), log=self.main.log),
+                      0, Qt.AlignmentFlag.AlignLeft)
+        lay.addStretch(1)
+        self.dossier_lay.addWidget(card)
+
+    def _overview_datasets(self):
+        g = self._graph
+
+        def people():
+            return (["id", "username", "name", "messages", "links"],
+                    [[e.attrs.get("id"), e.attrs.get("username", ""), e.label,
+                      len((self._umsgs or {}).get(e.key, [])), g.degree(e.key)]
+                     for e in g.entities_of(graph.USER)])
+
+        def groups():
+            return (["chat_id", "title", "posters"],
+                    [[e.attrs.get("chat_id"), e.label, g.degree(e.key)]
+                     for e in g.entities_of(graph.GROUP)])
+
+        def indicators():
+            return (["type", "value", "shared_by"],
+                    [[graph.LAYER_LABELS.get(graph.entity_layer(e), ""), e.label, g.degree(e.key)]
+                     for e in g.entities_of(graph.INDICATOR)])
+
+        return [("People", "people", people), ("Groups", "groups", groups),
+                ("Indicators", "indicators", indicators)]
+
+    def _open_indicator(self, key) -> None:
+        g = self._graph
+        ent = g.entities.get(key) if g else None
+        if ent is None:
+            return
+        self._subject_key = key
+        self._clear_dossier()
+        layer = graph.entity_layer(ent)
+        card = QFrame(); card.setObjectName("Card")
+        lay = QVBoxLayout(card); lay.setContentsMargins(16, 14, 16, 14); lay.setSpacing(4)
+        head = QLabel(ent.label); head.setStyleSheet("font-weight:600; font-size:15px;")
+        head.setWordWrap(True); head.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        lay.addWidget(head)
+        sharers = [k for k in g.neighbors(key) if g.entities[k].kind == graph.USER]
+        lay.addWidget(self._muted(f"{graph.LAYER_LABELS.get(layer, 'Indicator')}"
+                                  f"{' (likely false positive)' if layer == 'phones' else ''}"
+                                  f"  ·  shared by {len(sharers)} people"))
+        lay.addSpacing(4)
+        if sharers:
+            lay.addWidget(Collapsible(f"Shared by ({len(sharers)})",
+                lambda s=sharers: make_bars([(k, g.entities[k].label, "", g.degree(k)) for k in s],
+                    on_click=self._open_key), open=True))
+        val = ent.label
+        hits = []
+        for uk, msgs in (self._umsgs or {}).items():
+            who = g.entities[uk].label if uk in g.entities else uk
+            for m in msgs:
+                t = " ".join(str(m.get(f, "")) for f in intel._TEXT_FIELDS)
+                if val in t:
+                    hits.append((intel._msg_date(m), who, t))
+        hits.sort(key=lambda r: (r[0] or 0))
+        lay.addWidget(Collapsible(f"Messages ({len(hits)})", lambda h=hits: self._hits_table(h)))
+        lay.addStretch(1)
+        self.dossier_lay.addWidget(card)
+
+    def _hits_table(self, hits):
+        from datetime import datetime, timezone
+        table = QTableWidget(0, 3)
+        table.setHorizontalHeaderLabels(["Date", "From", "Message"])
+        table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
+        table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
+        table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
+        table.verticalHeader().setVisible(False); table.setShowGrid(False); table.setMaximumHeight(260)
+        for date, who, text in hits[-300:][::-1]:
+            r = table.rowCount(); table.insertRow(r)
+            d = datetime.fromtimestamp(date, timezone.utc).strftime("%Y-%m-%d %H:%M") if date else ""
+            table.setItem(r, 0, QTableWidgetItem(d))
+            table.setItem(r, 1, QTableWidgetItem(str(who)))
+            table.setItem(r, 2, QTableWidgetItem(text))
+        return table
+
+    def _open_subject(self, subject, key) -> None:
+        self._subject_key = key
+        self._clear_dossier()
+        card = QFrame(); card.setObjectName("Card")
+        lay = QVBoxLayout(card); lay.setContentsMargins(16, 14, 16, 14); lay.setSpacing(4)
+
+        g = self._graph
+        ent = g.entities.get(key) if g else None
+        msgs = (self._umsgs or {}).get(key, [])
+
+        title = QLabel(subject.display()); title.setStyleSheet("font-weight:600; font-size:16px;")
+        title.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        lay.addWidget(title)
+        idbits = []
+        if ent and ent.attrs.get("id"):
+            idbits.append(f"id {ent.attrs['id']}")
+        elif subject.user_id:
+            idbits.append(f"id {subject.user_id}")
+        if (ent and ent.attrs.get("username")) or subject.handle():
+            idbits.append("@" + ((ent and ent.attrs.get("username")) or subject.handle()))
+        sub = QLabel("  ·  ".join(idbits) or "no local data - enrich below")
+        sub.setObjectName("Muted"); lay.addWidget(sub)
+
+        groups = sorted((k for k in g.neighbors(key) if g.entities[k].kind == graph.GROUP),
+                        key=lambda k: -g.degree(k)) if (g and ent) else []
+        conns = g.connections_of(key, kinds=(graph.USER,)) if (g and ent) else {}
+        inds = [k for k in g.neighbors(key) if g.entities[k].kind == graph.INDICATOR] \
+            if (g and ent) else []
+
+        lay.addWidget(self._muted(
+            f"{len(msgs)} messages  ·  {len(groups)} groups  ·  {len(conns)} connected users  "
+            f"·  {len(inds)} indicators"))
+        lay.addSpacing(4)
+
+        if groups:
+            lay.addWidget(Collapsible(f"Groups seen in ({len(groups)})",
+                                      lambda gs=groups: self._groups_bar(gs), open=True))
+        if conns:
+            lay.addWidget(Collapsible(f"Connected users ({len(conns)})",
+                                      lambda cc=conns: self._conns_bar(cc)))
+        if inds:
+            lay.addWidget(Collapsible(f"Shared indicators ({len(inds)})",
+                                      lambda ii=inds: self._inds_bar(ii)))
+        if msgs:
+            lay.addWidget(Collapsible("Activity over time",
+                                      lambda m=msgs: self._activity(m), open=bool(groups) is False))
+            lay.addWidget(Collapsible("Active hours (UTC)", lambda m=msgs: self._hours(m)))
+            lay.addWidget(Collapsible("Most-used words", lambda m=msgs: self._words(m)))
+            lay.addWidget(Collapsible(f"Messages ({len(msgs)})", lambda m=msgs: self._messages(m)))
+
+        # Enrichment: one button per provider, greyed (with a reason) when not set up.
+        lay.addWidget(self._section("Enrich from outside sources · experimental"))
+        lay.addWidget(self._muted("Best-effort third-party lookups - may be partial, "
+                                  "rate-limited, or need credentials/a paid tier."))
+        er = QHBoxLayout(); er.setSpacing(8)
+        runall = icon_button("Run all ready", "search")
+        runall.clicked.connect(lambda: self._run_enrich(subject, None))
+        er.addWidget(runall)
+        for p in enrich.providers():
+            b = icon_button(_PROV_LABEL.get(p.name, p.name), _PROV_ICON.get(p.name, "search"))
+            ok, why = p.ready()
+            b.setEnabled(ok)
+            b.setToolTip(why or p.label)
+            b.clicked.connect(lambda _=False, pr=p: self._run_enrich(subject, pr))
+            er.addWidget(b)
+        er.addStretch(1)
+        ew = QWidget(); ew.setLayout(er); lay.addWidget(ew)
+
+        # Propose a personal account when the credentialed providers aren't set up.
+        tp = next((p for p in enrich.providers() if p.name == "telethon"), None)
+        if tp is not None and not tp.ready()[0]:
+            cta = QPushButton("Connect a personal Telegram account to unlock common groups, "
+                              "member lists and real ids  →  Keys")
+            cta.setFlat(True); cta.setCursor(Qt.CursorShape.PointingHandCursor)
+            cta.setStyleSheet(f"QPushButton{{border:none; color:{ACCENT}; text-align:left; "
+                              "padding:4px 0; background:transparent;}")
+            cta.clicked.connect(self.main.open_keys)
+            lay.addWidget(cta)
+
+        self._enrich_box = QVBoxLayout(); self._enrich_box.setSpacing(4)
+        ebw = QWidget(); ebw.setLayout(self._enrich_box); lay.addWidget(ebw)
+
+        lay.addStretch(1)
+        self.dossier_lay.addWidget(card)
+
+    # bar builders (lazy, inside collapsibles)
+    def _groups_bar(self, groups):
+        rows = []
+        for k in groups[:40]:
+            cid = self._graph.entities[k].attrs.get("chat_id")
+            rows.append((k, self.main.chat_label(cid), "", self._graph.degree(k)))
+        return make_bars(rows, on_click=lambda k: self.main.open_terrain(
+            self._graph.entities[k].attrs.get("chat_id")))
+
+    def _conns_bar(self, conns):
+        items = sorted(conns.items(), key=lambda kv: -len(kv[1]))[:40]
+        rows = [(k, self._graph.entities[k].label, f"via {len(via)}", len(via)) for k, via in items]
+        return make_bars(rows, on_click=self._open_key)
+
+    def _inds_bar(self, inds):
+        rows = []
+        for k in sorted(inds, key=lambda k: -self._graph.degree(k))[:40]:
+            e = self._graph.entities[k]
+            rows.append((k, e.label, _IND_LABELS.get(e.attrs.get("itype"), e.attrs.get("itype", "")),
+                         self._graph.degree(k)))
+        return make_bars(rows)
+
+    def _rows_from_msgs(self, msgs):
+        out = []
+        for m in msgs:
+            d = intel._msg_date(m)
+            t = " ".join(str(m.get(f, "")) for f in intel._TEXT_FIELDS).strip()
+            if t:
+                out.append((d, m.get("message_id", 0), t))
+        out.sort(key=lambda r: (r[0] or 0))
+        return out
+
+    def _activity(self, msgs):
+        tb = TimeBars(); tb.set_buckets(intel.time_buckets(
+            [intel._msg_date(m) for m in msgs if intel._msg_date(m)])); return tb
+
+    def _hours(self, msgs):
+        tb = TimeBars(); tb.setMinimumHeight(120)
+        tb.set_buckets([(f"{h:02d}", c) for h, c in intel.hour_histogram(
+            [intel._msg_date(m) for m in msgs if intel._msg_date(m)])])
+        return tb
+
+    def _words(self, msgs):
+        texts = [t for _, _, t in self._rows_from_msgs(msgs)]
+        words = intel.word_frequencies(texts, 15)
+        return make_bars([(w, w, "", c) for w, c in words]) if words \
+            else self._muted("Not enough text.")
+
+    def _messages(self, msgs):
+        from datetime import datetime, timezone
+        rows = self._rows_from_msgs(msgs)
+        table = QTableWidget(0, 2)
+        table.setHorizontalHeaderLabels(["Date", "Message"])
+        table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
+        table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
+        table.verticalHeader().setVisible(False); table.setShowGrid(False); table.setMaximumHeight(240)
+        for date, _mid, text in rows[-300:][::-1]:
+            r = table.rowCount(); table.insertRow(r)
+            d = datetime.fromtimestamp(date, timezone.utc).strftime("%Y-%m-%d %H:%M") if date else ""
+            table.setItem(r, 0, QTableWidgetItem(d)); table.setItem(r, 1, QTableWidgetItem(text))
+        return table
+
+    def _section(self, text):
+        lab = QLabel(text); lab.setStyleSheet(f"color:{ACCENT}; padding-top:8px; font-size:12px;")
+        return lab
+
+    def _muted(self, text):
+        lab = QLabel(text); lab.setObjectName("Muted"); lab.setWordWrap(True); return lab
+
+    # ---- enrichment ----
+    def _run_enrich(self, subject, which) -> None:
+        provs = [which] if which is not None else [p for p in enrich.providers() if p.ready()[0]]
+        if not provs:
+            self._add_finding_row("No provider is ready. Set up TGStat / Telethon in the Keys tab.",
+                                  muted=True)
+            return
+        self._add_finding_row("Running " + ", ".join(p.name for p in provs) + "...", muted=True)
+        w = EnrichWorker(provs, subject)
+        self._enrich_worker = w
+        self.main._track(w)
+        w.result.connect(self._on_enrich)
+        w.start()
+
+    def _on_enrich(self, result) -> None:
+        if not result.ok:
+            self._add_finding_row(f"[{result.provider}] {result.error}", muted=True)
+            return
+        for f in result.findings:
+            self._add_finding_row(f"[{f.source}] {f.value}", url=f.url,
+                                  strong=(f.confidence == "confirmed"))
+
+    def _add_finding_row(self, text, *, url=None, muted=False, strong=False) -> None:
+        row = QWidget(); row.setStyleSheet("background:transparent;")
+        rl = QHBoxLayout(row); rl.setContentsMargins(0, 1, 0, 1); rl.setSpacing(8)
+        lab = QLabel(text); lab.setWordWrap(True)
+        if muted:
+            lab.setObjectName("Muted")
+        if strong:
+            lab.setStyleSheet("font-weight:600;")
+        lab.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        rl.addWidget(lab, 1)
+        if url:
+            op = QPushButton("Open"); op.setFixedHeight(24)
+            op.setCursor(Qt.CursorShape.PointingHandCursor)
+            op.clicked.connect(lambda _=False, u=url: QDesktopServices.openUrl(QUrl(u)))
+            rl.addWidget(op, 0, Qt.AlignmentFlag.AlignTop)
+        self._enrich_box.addWidget(row)
+
+
+class NexusPage(BasePage):
+    title = "Graph"
+    fill = True
+    subtitle = ("Everyone and everything you've collected, linked. Users, the groups they "
+                "post in, and the indicators they share - across all your bots and sources.")
+
+    def build(self) -> None:
+        bar = QHBoxLayout(); bar.setSpacing(8)
+        self.focus = QLineEdit()
+        self.focus.setPlaceholderText("a person / @handle / id - leave empty to see everyone")
+        self.focus.returnPressed.connect(self._render)
+        bar.addWidget(field("Center the graph on", self.focus), 1)
+
+        self.sources_btn = self.main.sources_button(self._render)
+        bar.addWidget(self.sources_btn, 0, Qt.AlignmentFlag.AlignBottom)
+
+        # One dropdown holds every knob: depth + min-links sliders and the layer
+        # multi-select, so the bar stays clean.
+        self.view_btn = QToolButton(); self.view_btn.setText("View")
+        self.view_btn.setIcon(make_icon("gear", TEXT, 16)); self.view_btn.setIconSize(ICON)
+        self.view_btn.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextBesideIcon)
+        self.view_btn.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
+        self.view_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.view_btn.setMenu(self._build_view_menu())
+        bar.addWidget(self.view_btn, 0, Qt.AlignmentFlag.AlignBottom)
+        rebuild = icon_button("Rebuild", "refresh"); rebuild.clicked.connect(self._rebuild)
+        fit = icon_button("Fit", "chart"); fit.clicked.connect(lambda: self.view.fit())
+        bar.addWidget(rebuild, 0, Qt.AlignmentFlag.AlignBottom)
+        bar.addWidget(fit, 0, Qt.AlignmentFlag.AlignBottom)
+        self.root.addLayout(bar)
+
+        self.view = GraphView()
+        self.view.load_overrides(store.load_graph_style())
+        self.view.nodeClicked.connect(self._on_node)
+        self.view.nodeActivated.connect(self._on_activate)
+        self.view.reclassify.connect(self._on_reclassify)
+        self.view.styleChanged.connect(self._save_style)
+        self.root.addWidget(self.view, 1)
+        self.detail = QLabel("Click a node to inspect it; double-click a person to investigate, "
+                             "a group to open it in Terrain. Right-click a node to rename, "
+                             "recolour, resize or fix its type.")
+        self.detail.setObjectName("Muted"); self.detail.setWordWrap(True)
+        self.root.addWidget(self.detail)
+
+    def _build_view_menu(self) -> QMenu:
+        menu = style_menu(QMenu(self))
+        self.radius = QSlider(Qt.Orientation.Horizontal); self.radius.setRange(1, 3); self.radius.setValue(1)
+        self.radius.valueChanged.connect(self._render)
+        menu.addAction(self._slider_row(menu, "Depth around focus", self.radius))
+        self.min_deg = QSlider(Qt.Orientation.Horizontal); self.min_deg.setRange(1, 10); self.min_deg.setValue(1)
+        self.min_deg.valueChanged.connect(self._render)
+        menu.addAction(self._slider_row(menu, "Min links per node", self.min_deg))
+        menu.addSeparator()
+        hdr = menu.addAction("Layers to show"); hdr.setEnabled(False)
+        # Phones are regex false-positive prone, so off by default; the rest on.
+        default_on = set(graph.LAYERS) - {"phones"}
+        self.layer_checks = {}
+        for layer in graph.LAYERS:
+            cb = QCheckBox(graph.LAYER_LABELS[layer]); cb.setChecked(layer in default_on)
+            cb.toggled.connect(self._render)
+            self.layer_checks[layer] = cb
+            menu.addAction(self._wrap_action(menu, cb))
+        return menu
+
+    def _slider_row(self, menu, label, slider) -> QWidgetAction:
+        slider.setFixedWidth(140)
+        wa = QWidgetAction(menu)
+        w = QWidget(); h = QHBoxLayout(w); h.setContentsMargins(10, 4, 10, 4); h.setSpacing(8)
+        lab = QLabel(label); lab.setStyleSheet(f"color:{TEXT};")
+        val = QLabel(str(slider.value())); val.setObjectName("Muted"); val.setFixedWidth(14)
+        slider.valueChanged.connect(lambda v, vl=val: vl.setText(str(v)))
+        h.addWidget(lab); h.addStretch(1); h.addWidget(val); h.addWidget(slider)
+        wa.setDefaultWidget(w)
+        return wa
+
+    def _wrap_action(self, menu, widget) -> QWidgetAction:
+        wa = QWidgetAction(menu)
+        w = QWidget(); h = QHBoxLayout(w); h.setContentsMargins(12, 1, 12, 1); h.addWidget(widget)
+        wa.setDefaultWidget(w)
+        return wa
+
+    def on_shown(self) -> None:
+        self._graph, _ = self.main.get_graph()
+        self._render()
+
+    def _rebuild(self) -> None:
+        self.main.invalidate_graph()
+        self._graph, _ = self.main.get_graph()
+        self._render()
+
+    def _on_reclassify(self, key, layer) -> None:
+        ent = self._graph.entities.get(key) if self._graph else None
+        if ent is not None:
+            ent.attrs["_layer"] = layer
+            self.main.log(f"[OK] Reclassified node as {graph.LAYER_LABELS.get(layer, layer)}.")
+        styles = store.load_graph_style()
+        styles.setdefault(key, {})["layer"] = layer
+        store.save_graph_style(styles)
+        self._render()
+
+    def _save_style(self, key) -> None:
+        # Persist the node's hand styling (color/size/label) alongside any layer.
+        styles = store.load_graph_style()
+        rec = styles.setdefault(key, {})
+        rec.update(self.view.overrides_for(key))
+        store.save_graph_style(styles)
+
+    def _resolve_focus(self):
+        g = self._graph
+        raw = self.focus.text().strip().lower()
+        if not raw or g is None:
+            return None
+        for e in g.entities_of(graph.USER):
+            hay = f"{e.label} {e.attrs.get('username','')} {e.attrs.get('id','')}".lower()
+            if raw.lstrip("@") in hay:
+                return e.key
+        return None
+
+    def _render(self) -> None:
+        g = getattr(self, "_graph", None)
+        if g is None or not g.entities:
+            self.view.set_graph(None)
+            if not self.main._selected_bots:
+                self.detail.setText("No data yet - pick a source (bot) in 'Sources' to draw its graph.")
+            else:
+                self.detail.setText("No data yet - the selected source hasn't collected messages.")
+            return
+        focus = self._resolve_focus()
+        view_g = g.ego(focus, radius=self.radius.value()) if focus else g
+        # Layer filter (the multi-select in the View dropdown).
+        enabled = {L for L, cb in self.layer_checks.items() if cb.isChecked()}
+        keep = [k for k, e in view_g.entities.items() if graph.entity_layer(e) in enabled]
+        view_g = view_g.subgraph(keep)
+        md = self.min_deg.value()
+        if md > 1:
+            keep = [k for k in view_g.entities if view_g.degree(k) >= md]
+            view_g = view_g.subgraph(keep)
+        note = ""
+        if len(view_g.entities) > 250:
+            top = {e.key for e in view_g.top_by_degree(n=250)}
+            view_g = view_g.subgraph(top)
+            note = " (showing the 250 most-connected; focus a subject or raise 'min links' to narrow)"
+        self.view.set_graph(view_g)
+        self.detail.setText(f"{len(view_g.entities)} nodes · {len(view_g.edges)} links{note}")
+
+    def _on_node(self, key) -> None:
+        g = self._graph
+        e = g.entities.get(key) if g else None
+        if e is None:
+            return
+        extra = ""
+        if e.kind == graph.USER:
+            extra = " — double-click to investigate"
+        elif e.kind == graph.GROUP:
+            extra = f" — {self.main.chat_label(e.attrs.get('chat_id'))}, double-click to open in Terrain"
+        self.detail.setText(f"{e.kind}: {e.label}  ·  {g.degree(key)} links{extra}")
+
+    def _on_activate(self, key) -> None:
+        g = self._graph
+        e = g.entities.get(key) if g else None
+        if e is None:
+            return
+        if e.kind == graph.USER:
+            self.main.open_investigator_key(key)
+        elif e.kind == graph.GROUP:
+            self.main.open_terrain(e.attrs.get("chat_id"))
+
+
 _NAV = [
-    ("Connection", [("Bot & chat", ConnectionPage)]),
-    ("Members", [("Admins", AdminsPage), ("Member info", MemberPage),
-                 ("Bot rights", RightsPage), ("Invitations", InvitePage)]),
-    ("Analyse", [("Conversation", ConversationPage), ("Report", ReportPage)]),
+    ("Connection", [("Bot & chat", ConnectionPage), ("Keys", CredentialsPage)]),
+    ("Bot control", [("Conversation", ConversationPage), ("Admins", AdminsPage),
+                     ("Bot rights", RightsPage), ("Invitations", InvitePage)]),
+    ("Investigateur", [("Investigator", InvestigatorPage)]),
+    ("Nexus", [("Graph", NexusPage)]),
 ]
 
 
@@ -2019,19 +2256,30 @@ def _read_json_keys() -> set:
 
 
 class MainWindow(QMainWindow):
+    # Emitted (from any thread) when a group is upgraded to a supergroup mid-call.
+    migrated = pyqtSignal(object, object)
+
     def __init__(self) -> None:
         super().__init__()
         self.session = Session()
+        self.session.migrate_cb = lambda old, new: self.migrated.emit(old, new)
+        self.migrated.connect(self._on_migrated)
         self.settings = store.load_settings()
         self._workers: set = set()
         self._threads: set = set()       # every live QThread, kept until finished
         self._pollers: dict = {}         # bot_id -> UpdatesPoller
+        self._poller_retries: dict = {}  # bot_id -> consecutive poll failures (for backoff)
         self._chats_by_bot: dict = {}    # bot_id -> {chat_id: info}
         self._backfills: dict = {}       # (bot_id, chat_id) -> BackfillWorker | None (reserving)
         self._viewed_chat = None         # (bot_id, chat_id) shown in Conversation
         self._cant_backfill: set = set() # (bot_id, chat_id) the bot can't walk (no delete right)
         self._hidden_tokens: set = set() # bot_ids hidden from the picker this session
         self._hidden_chats: set = set()  # (bot_id, chat_id str) hidden from the picker this session
+        self._graph_cache = None         # (graph, user_messages) built lazily from the store
+        self._graph_cache_key = None
+        # Which bots feed the graph. Empty by default: the graph shows nothing
+        # until you pick a source, so it never guesses across unrelated bots.
+        self._selected_bots = set(str(b) for b in self.settings.get("graph_sources", []))
         self.arrivals: list = []
         self.setWindowTitle("Telegram Tools")
         self.setWindowIcon(app_icon(ACCENT))
@@ -2182,11 +2430,15 @@ class MainWindow(QMainWindow):
                                  "where the bot is, then it appears here")
             act.setEnabled(False)
         for c in chats:
-            icon = "message" if c.get("type") in ("channel",) else "users"
-            act = menu.addAction(make_icon(icon, TEXT, 17),
-                                 f"{c['title']}  ({c['type']})  -  {c['id']}")
-            act.setData(("chat", bot_id, str(c["id"])))
-            act.triggered.connect(lambda _=False, cid=c["id"]: self._set_chat(cid))
+            cid = c.get("id")
+            if cid is None:
+                continue
+            title = c.get("title") or c.get("username") or c.get("first_name") or f"chat {cid}"
+            ctype = c.get("type") or "?"
+            icon = "message" if ctype == "channel" else "users"
+            act = menu.addAction(make_icon(icon, TEXT, 17), f"{title}  ({ctype})  -  {cid}")
+            act.setData(("chat", bot_id, str(cid)))
+            act.triggered.connect(lambda _=False, c_id=cid: self._set_chat(c_id))
         if chats:
             hint = menu.addAction("Right-click an entry to forget it")
             hint.setEnabled(False)
@@ -2270,9 +2522,10 @@ class MainWindow(QMainWindow):
         return w
 
     _NAV_ICONS = {
-        "Bot & chat": "plug", "Admins": "users", "Member info": "user",
+        "Bot & chat": "plug", "Keys": "key", "Admins": "users",
         "Bot rights": "shield", "Invitations": "link", "New arrivals": "broadcast",
         "Archive messages": "archive", "Report": "chart", "Conversation": "message",
+        "Investigator": "scan", "Graph": "share",
     }
 
     def _build_sidebar(self) -> QWidget:
@@ -2281,22 +2534,41 @@ class MainWindow(QMainWindow):
         self.nav = QListWidget(); self.nav.setObjectName("Nav")
         self.nav.setIconSize(QSize(17, 17))
         self._page_rows: list = []  # row index -> page class or None
+        self._sections: list = []   # (header_item, [child_items]) - collapsible blocks
         for section, items in _NAV:
             head = QListWidgetItem(section.upper())
-            head.setFlags(Qt.ItemFlag.NoItemFlags)
+            head.setFlags(Qt.ItemFlag.ItemIsEnabled)          # clickable, not selectable
+            head.setIcon(make_icon("chevron", TEXT_MUTED, 13))
             f = QFont(); f.setPointSize(8); f.setBold(True); head.setFont(f)
             head.setForeground(QColor(TEXT_MUTED))
             head.setSizeHint(QSize(0, 30))
+            head.setData(Qt.ItemDataRole.UserRole, ("header", len(self._sections)))
             self.nav.addItem(head)
             self._page_rows.append(None)
+            children = []
             for label, cls in items:
                 it = QListWidgetItem(make_icon(self._NAV_ICONS.get(label, "search"), TEXT_MUTED, 17), label)
                 it.setSizeHint(QSize(0, 38))
                 self.nav.addItem(it)
                 self._page_rows.append(cls)
+                children.append(it)
+            self._sections.append((head, children))
         self.nav.currentRowChanged.connect(self._nav_changed)
+        self.nav.itemClicked.connect(self._nav_item_clicked)
         lay.addWidget(self.nav)
         return side
+
+    def _nav_item_clicked(self, item) -> None:
+        data = item.data(Qt.ItemDataRole.UserRole)
+        if isinstance(data, tuple) and data and data[0] == "header":
+            self._toggle_section(data[1])
+
+    def _toggle_section(self, idx: int) -> None:
+        head, children = self._sections[idx]
+        collapse = any(not c.isHidden() for c in children)   # any visible -> collapse all
+        for c in children:
+            c.setHidden(collapse)
+        head.setIcon(make_icon("chevron_right" if collapse else "chevron", TEXT_MUTED, 13))
 
     def _build_log_drawer(self) -> QWidget:
         # Hidden by default: results take the space, logs stay out of the way.
@@ -2325,7 +2597,11 @@ class MainWindow(QMainWindow):
         settings_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         settings_btn.setStyleSheet("border:none; padding:4px 8px; color:" + TEXT_MUTED + ";")
         settings_btn.clicked.connect(self._open_settings)
-        lay.addStretch(1)
+        # The latest activity / error, always visible (errors used to hide in the log).
+        self.status_line = QLabel("")
+        self.status_line.setStyleSheet(f"color:{TEXT_MUTED};")
+        self.status_line.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        lay.addWidget(self.status_line, 1)
         lay.addWidget(settings_btn)
         lay.addWidget(self.logs_toggle)
         return bar
@@ -2452,11 +2728,163 @@ class MainWindow(QMainWindow):
         if page is not None and hasattr(page, "on_shown"):
             page.on_shown()
 
+    # ---- cross-bot graph + cross-tab navigation (Investigator / Nexus) ----
+    def get_graph(self):
+        """The relationship graph + per-user messages, built from the SELECTED
+        bots only (empty when none are picked), cached until that or the data
+        changes. Persisted reclassifications are re-applied here."""
+        key = tuple(sorted(self._selected_bots))
+        if self._graph_cache is None or self._graph_cache_key != key:
+            sources = [(b, m) for b, m in store.all_sources() if b in self._selected_bots]
+            g = graph.build_graph(sources)
+            # Groups come out of the store as raw chat ids - give them the real
+            # title from any bot's known chats so the graph shows names.
+            for e in g.entities_of(graph.GROUP):
+                title = self._chat_title(e.attrs.get("chat_id"))
+                if title:
+                    e.label = title
+            # Re-apply saved hand reclassifications (color/size/label handled in the view).
+            for k, st in store.load_graph_style().items():
+                e = g.entities.get(k)
+                if e is not None and st.get("layer"):
+                    e.attrs["_layer"] = st["layer"]
+            self._graph_cache = (g, graph.user_messages(sources))
+            self._graph_cache_key = key
+        return self._graph_cache
+
+    def set_selected_bots(self, bots) -> None:
+        self._selected_bots = set(str(b) for b in bots)
+        self.settings["graph_sources"] = sorted(self._selected_bots)
+        store.save_settings(self.settings)
+        self.invalidate_graph()
+
+    def sources_button(self, on_change) -> QToolButton:
+        """A 'Sources' dropdown: tick which bots feed the graph. Repopulated each
+        time it opens so newly-seen bots appear. Shared by Nexus and Investigator."""
+        btn = QToolButton(); btn.setText("Sources")
+        btn.setIcon(make_icon("robot", TEXT, 16)); btn.setIconSize(ICON)
+        btn.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextBesideIcon)
+        btn.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
+        btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        menu = style_menu(QMenu(btn))
+
+        def repopulate():
+            menu.clear()
+            tokens = store.load_tokens()
+            bots = store.message_bots()
+            if not bots:
+                a = menu.addAction("No collected data yet"); a.setEnabled(False)
+                return
+            for bid in bots:
+                name = tokens.get(str(bid), {}).get("username")
+                label = f"@{name}" if name else f"bot {bid}"
+                cb = QCheckBox(f"{label}  ·  {store.collected_count(bid)} msgs")
+                cb.setChecked(str(bid) in self._selected_bots)
+                cb.toggled.connect(lambda on, b=str(bid): self._toggle_source(b, on, on_change))
+                wa = QWidgetAction(menu); w = QWidget(); h = QHBoxLayout(w)
+                h.setContentsMargins(12, 2, 12, 2); h.addWidget(cb)
+                wa.setDefaultWidget(w); menu.addAction(wa)
+
+        menu.aboutToShow.connect(repopulate)
+        btn.setMenu(menu)
+        return btn
+
+    def _toggle_source(self, bid, on, on_change) -> None:
+        sel = set(self._selected_bots)
+        sel.add(bid) if on else sel.discard(bid)
+        self.set_selected_bots(sel)
+        on_change()
+
+    def _chat_title(self, chat_id):
+        if chat_id is None:
+            return None
+        for chats in self._chats_by_bot.values():
+            c = chats.get(str(chat_id))
+            if c and c.get("title"):
+                return c["title"]
+        return None
+
+    def _on_migrated(self, old, new) -> None:
+        """A group was upgraded to a supergroup: its id changed. Follow the new id
+        everywhere - the client already retried the call, we move the state."""
+        bot_id = self.session.bot_id
+        self.log(f"[INFO] Chat {old} was upgraded to a supergroup -> {new}. Following it.")
+        if bot_id is not None:
+            chats = self._chats_by_bot.get(bot_id, {})
+            entry = chats.pop(str(old), None) or {"id": new, "type": "supergroup"}
+            entry["id"] = new
+            chats[str(new)] = entry
+            self._chats_by_bot[bot_id] = chats
+            store.save_chats(bot_id, chats)
+            store.migrate_chat_id(bot_id, old, new)
+            store.migrate_backfill(bot_id, old, new)
+            self._cant_backfill = {(b, new) if (b == bot_id and str(c) == str(old)) else (b, c)
+                                   for (b, c) in self._cant_backfill}
+        if str(self.session.chat) == str(old):
+            self.session.chat = new
+            self.chat_in.blockSignals(True); self.chat_in.setText(str(new)); self.chat_in.blockSignals(False)
+            if self._viewed_chat and str(self._viewed_chat[1]) == str(old):
+                self._viewed_chat = (bot_id, new)
+            self._invalidate_display()
+            self._refresh_active_page()
+        self.invalidate_graph()
+        self.schedule_backfills()
+
+    def invalidate_graph(self) -> None:
+        self._graph_cache = None
+
+    def chat_label(self, chat_id) -> str:
+        """A readable name for a chat id, from any bot's known chats."""
+        if chat_id is None:
+            return "?"
+        for chats in self._chats_by_bot.values():
+            c = chats.get(str(chat_id))
+            if c and c.get("title"):
+                return f"{c['title']} ({chat_id})"
+        return str(chat_id)
+
+    def _row_of(self, cls) -> Optional[int]:
+        for row, c in enumerate(self._page_rows):
+            if c is cls:
+                return row
+        return None
+
+    def open_terrain(self, chat_id) -> None:
+        if chat_id is None:
+            return
+        self._set_chat(chat_id)
+        row = self._row_of(ConversationPage)
+        if row is not None:
+            self.nav.setCurrentRow(row)
+
+    def open_investigator_key(self, key) -> None:
+        row = self._row_of(InvestigatorPage)
+        if row is None:
+            return
+        page = self._pages.get(row)
+        if page is not None:
+            page.open_pending(key)
+        self.nav.setCurrentRow(row)
+
+    def open_keys(self) -> None:
+        row = self._row_of(CredentialsPage)
+        if row is not None:
+            self.nav.setCurrentRow(row)
+
     # ---- background pollers: one per saved bot, all running at once ----
     def _set_active_bot(self, bot_id) -> None:
         self.session.bot_id = bot_id
         self.session.known_chats = self._chats_by_bot.setdefault(
             bot_id, store.load_chats(bot_id))
+        # Make the graph/investigator show the bot you just connected (you can
+        # still deselect it, or add others, in 'Sources'). Fixes "I connected a
+        # bot but Graph/Investigator are empty".
+        bid = str(bot_id)
+        if bid not in self._selected_bots:
+            self._selected_bots.add(bid)
+            self.settings["graph_sources"] = sorted(self._selected_bots)
+            store.save_settings(self.settings)
+            self.invalidate_graph()
 
     def _ensure_poller(self, token: str, bot_id) -> None:
         if bot_id in self._pollers:
@@ -2491,7 +2919,9 @@ class MainWindow(QMainWindow):
 
     def _on_message(self, bot_id, msg: dict) -> None:
         # Passive archive: every message the bot receives is kept locally.
+        self._poller_retries[bot_id] = 0   # we're receiving again: reset backoff
         store.append_messages(bot_id, [msg])
+        self._graph_cache = None   # store changed: the graph is rebuilt on next view
         # Live-feed the conversation view if it's showing this chat.
         if bot_id == self.session.bot_id and str(msg.get("chat_id")) == str(self.session.chat):
             conv = next((p for p in self._pages.values()
@@ -2516,8 +2946,26 @@ class MainWindow(QMainWindow):
 
     def _on_poller_stopped(self, bot_id, reason: str) -> None:
         self._pollers.pop(bot_id, None)
-        if reason:
-            self.log(f"[ERROR] Background poller for bot {bot_id} stopped: {reason}")
+        if not reason:
+            return   # clean stop (app closing / replaced)
+        n = self._poller_retries.get(bot_id, 0) + 1
+        self._poller_retries[bot_id] = n
+        # A revoked/invalid token can't be fixed by retrying - surface it and stop.
+        if "[401]" in reason or "unauthorized" in reason.lower():
+            if bot_id == self.session.bot_id:
+                self.set_bot_status(False, "Token invalid")
+            self.log(f"[ERROR] Live updates stopped for bot {bot_id}: {reason}")
+            return
+        # Anything else (almost always a 409 Conflict - a previous long-poll still
+        # open, or a second consumer) is transient and clears itself, so NEVER give
+        # up: retry forever with capped backoff, quietly. Giving up would silently
+        # kill reception while the status still shows "connected".
+        self.log(f"[ERROR] Live updates for bot {bot_id} stopped: {reason}", quiet=True)
+        delay = min(5 * n, 30)
+        token = store.load_tokens().get(str(bot_id), {}).get("token", "")
+        if token:
+            QTimer.singleShot(delay * 1000,
+                              lambda t=token, b=bot_id: self._ensure_poller(t, b))
 
     # ---- backfill scheduler: walk the past of at most N chats at once ----
     # Rate limits make walking every chat's history at once impossible, so we
@@ -2531,6 +2979,14 @@ class MainWindow(QMainWindow):
 
     def is_backfilling(self, bot_id, chat_id) -> bool:
         return self._backfills.get((bot_id, chat_id)) is not None
+
+    def clear_backfill_block(self, bot_id, chat_id) -> None:
+        """Forget a 'can't walk this chat' mark (e.g. after the bot is granted the
+        delete right) and let the scheduler try it again."""
+        for key in [k for k in self._cant_backfill
+                    if k[0] == bot_id and str(k[1]) == str(chat_id)]:
+            self._cant_backfill.discard(key)
+        self.schedule_backfills()
 
     def schedule_backfills(self) -> None:
         bot_id = self.session.bot_id
@@ -2582,16 +3038,19 @@ class MainWindow(QMainWindow):
         gap = int(self.settings.get("max_gap", 400))
 
         def prepare():
-            perms = api.get_bot_permissions(client, chat)
-            can_delete = perms.get("status") == "creator" or (
-                perms.get("status") == "administrator" and perms.get("can_delete_messages"))
+            # The original hack (messagesDumper.py) just forwards each id back and
+            # reads the response - NO permission gate. A forward works for any bot
+            # that can post here, and deleting the copy afterwards is deleting the
+            # bot's OWN outgoing message, which needs no admin right. So there is no
+            # delete-rights precondition; gating on it was a regression that wrongly
+            # skipped the walk. Per-id forward failures are handled in the worker.
             if floor is not None:
                 start = floor - 1
             elif min_collected is not None:
                 start = min_collected - 1
             else:
                 start = api.current_max_message_id(client, chat)
-            return {"can_delete": bool(can_delete), "start": start}
+            return {"start": start}
 
         def go(info):
             # If the slot was released while preparing (bot changed/disconnected),
@@ -2602,14 +3061,6 @@ class MainWindow(QMainWindow):
             if info["start"] < 1:
                 store.update_backfill(bot_id, chat, done=True)  # nothing older exists
                 self._backfills.pop((bot_id, chat), None)
-                self.schedule_backfills()
-                return
-            if not info["can_delete"]:
-                # Can't clean up the copies it would make - skip for this session.
-                self._cant_backfill.add((bot_id, chat))
-                self._backfills.pop((bot_id, chat), None)
-                self.log(f"[INFO] Chat {chat}: walking the past needs the bot to be an admin "
-                         "with delete rights (to remove the copies it makes). Skipped.")
                 self.schedule_backfills()
                 return
             w = BackfillWorker(client, source_chat=chat, start_id=info["start"],
@@ -2678,9 +3129,16 @@ class MainWindow(QMainWindow):
         self.dot.setStyleSheet(f"color:{color};")
         self.status.setText(text)
 
-    def log(self, msg: str) -> None:
-        # Kept in the (hidden) Logs drawer only; nothing noisy on the bar.
+    def log(self, msg: str, quiet: bool = False) -> None:
         self.logbox.appendPlainText(msg)
+        # quiet = keep it in the Logs drawer only (e.g. the recurring getUpdates
+        # 409 conflict), so the status bar isn't spammed with background noise.
+        if quiet:
+            return
+        line = " ".join(str(msg).split())
+        is_err = "[ERROR]" in line
+        self.status_line.setText(line[:160])
+        self.status_line.setStyleSheet(f"color:{DANGER};" if is_err else f"color:{TEXT_MUTED};")
 
     # ---- settings ----
     def _open_settings(self) -> None:

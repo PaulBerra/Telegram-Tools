@@ -33,6 +33,7 @@ class TelegramClient:
         max_rate_limit_retries: int = 5,
         max_retry_after: int = 300,
         sleep: Callable[[float], None] = time.sleep,
+        on_migrate: Optional[Callable[[Any, Any], None]] = None,
     ) -> None:
         if not token or ":" not in token:
             raise ValueError("A Telegram bot token looks like '123456:ABC-...'.")
@@ -44,6 +45,9 @@ class TelegramClient:
         self.max_rate_limit_retries = max_rate_limit_retries
         self.max_retry_after = max_retry_after
         self._sleep = sleep
+        # Called with (old_chat_id, new_chat_id) when a group is upgraded to a
+        # supergroup mid-call, so the app can move its state to the new id.
+        self._on_migrate = on_migrate
 
     @property
     def bot_id(self) -> str:
@@ -67,6 +71,7 @@ class TelegramClient:
 
         network_attempts = 0
         rate_attempts = 0
+        migrated = False
         while True:
             try:
                 if http_method.upper() == "GET":
@@ -91,13 +96,31 @@ class TelegramClient:
 
             code = data.get("error_code")
             desc = data.get("description", "unknown error")
+            parameters = data.get("parameters") or {}
 
             if code == 429:
-                retry_after = int(data.get("parameters", {}).get("retry_after", 1))
+                retry_after = int(parameters.get("retry_after", 1))
                 rate_attempts += 1
                 if rate_attempts > self.max_rate_limit_retries or retry_after > self.max_retry_after:
                     raise RateLimited(desc, retry_after, method)
                 self._sleep(retry_after)
                 continue
 
-            raise APIError(code, desc, method)
+            # Group -> supergroup upgrade: the old chat id is dead, Telegram hands
+            # us the new one. Follow it once so the call still succeeds, and tell
+            # the app so it moves its state over.
+            new_id = parameters.get("migrate_to_chat_id")
+            if new_id is not None and not migrated and "chat_id" in payload:
+                old_id = payload["chat_id"]
+                payload["chat_id"] = new_id
+                if "from_chat_id" in payload and payload["from_chat_id"] == old_id:
+                    payload["from_chat_id"] = new_id
+                migrated = True
+                if self._on_migrate is not None:
+                    try:
+                        self._on_migrate(old_id, new_id)
+                    except Exception:
+                        pass
+                continue
+
+            raise APIError(code, desc, method, parameters)

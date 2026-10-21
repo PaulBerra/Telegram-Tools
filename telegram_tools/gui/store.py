@@ -20,6 +20,7 @@ _TOKENS = os.path.join(DIR, "tokens.json")
 _MSG_DIR = os.path.join(DIR, "messages")
 _SETTINGS = os.path.join(DIR, "settings.json")
 _BACKFILL = os.path.join(DIR, "backfill.json")
+_GRAPH_STYLE = os.path.join(DIR, "graph_style.json")
 
 
 def _read(path, default):
@@ -154,6 +155,7 @@ DEFAULT_SETTINGS = {
     "max_gap": 400,              # give up after this many missing ids in a row
     "conversation_limit": 500,   # messages kept on screen in the timeline
     "logs_open": False,          # show the log drawer on launch
+    "graph_sources": [],         # bot ids whose data feeds the graph (empty = none)
 }
 
 
@@ -171,6 +173,17 @@ def save_settings(settings: dict) -> None:
     _write(_SETTINGS, {k: settings.get(k, DEFAULT_SETTINGS[k]) for k in DEFAULT_SETTINGS})
 
 
+# --- graph node styling / reclassification (persists what the user customises) ---
+def load_graph_style() -> dict:
+    """{node_key: {"color":.., "size":.., "label":.., "layer":..}} - any subset."""
+    data = _read(_GRAPH_STYLE, {})
+    return data if isinstance(data, dict) else {}
+
+
+def save_graph_style(data: dict) -> None:
+    _write(_GRAPH_STYLE, data)
+
+
 # --- backfill progress: how far back we've walked each chat, per bot ---
 def load_backfill(bot_id) -> dict:
     """{chat_id(str): {"lowest": id, "max_seen": id, "done": bool, "updated": ts}}"""
@@ -179,6 +192,40 @@ def load_backfill(bot_id) -> dict:
 
 def backfill_record(bot_id, chat_id) -> dict:
     return load_backfill(bot_id).get(str(chat_id), {})
+
+
+def migrate_backfill(bot_id, old_chat, new_chat) -> None:
+    data = _read(_BACKFILL, {})
+    per = data.get(str(bot_id))
+    if per and str(old_chat) in per:
+        per[str(new_chat)] = per.pop(str(old_chat))
+        _write(_BACKFILL, data)
+
+
+def migrate_chat_id(bot_id, old_chat, new_chat) -> None:
+    """Rewrite a bot's message log, moving one chat's messages to a new id
+    (group -> supergroup upgrade changes the id)."""
+    path = messages_path(bot_id)
+    if not os.path.exists(path):
+        return
+    try:
+        out = []
+        with open(path, encoding="utf-8") as fh:
+            for line in fh:
+                s = line.strip()
+                if not s:
+                    continue
+                try:
+                    m = json.loads(s)
+                except ValueError:
+                    continue
+                if str(m.get("chat_id")) == str(old_chat):
+                    m["chat_id"] = new_chat
+                out.append(json.dumps(m, ensure_ascii=False))
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write("\n".join(out) + ("\n" if out else ""))
+    except OSError:
+        pass
 
 
 def update_backfill(bot_id, chat_id, *, lowest=None, max_seen=None, done=None) -> None:
@@ -193,6 +240,37 @@ def update_backfill(bot_id, chat_id, *, lowest=None, max_seen=None, done=None) -
         rec["done"] = bool(done)
     rec["updated"] = int(time.time())
     _write(_BACKFILL, data)
+
+
+def message_bots() -> list:
+    """Bot ids that have a collected-message log on disk."""
+    try:
+        return [fn[:-len(".ndjson")] for fn in os.listdir(_MSG_DIR) if fn.endswith(".ndjson")]
+    except OSError:
+        return []
+
+
+def load_all_messages(bot_id) -> list:
+    """Every message collected for a bot, across all its chats (no de-dup)."""
+    out = []
+    try:
+        with open(messages_path(bot_id), encoding="utf-8") as fh:
+            for line in fh:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    out.append(json.loads(line))
+                except ValueError:
+                    continue
+    except OSError:
+        return []
+    return out
+
+
+def all_sources() -> list:
+    """(bot_id, messages) for every bot - feed straight to core.graph.build_graph."""
+    return [(bid, load_all_messages(bid)) for bid in message_bots()]
 
 
 def load_messages_for(bot_id, chat_id) -> list:

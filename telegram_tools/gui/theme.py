@@ -93,6 +93,9 @@ QWidget {{
 }}
 /* Labels inherit no page-grey fill, so text never sits on a grey square. */
 QLabel {{ background: transparent; }}
+/* field() wrappers: transparent (qualified so it doesn't cascade to the input),
+   otherwise the global QWidget grey shows as a box on white cards. */
+QWidget#Field {{ background: transparent; }}
 QFrame#ConnectionBar {{
     background-color: {g['SURFACE']};
     border-bottom: 1px solid {g['BORDER']};

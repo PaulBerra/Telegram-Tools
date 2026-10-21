@@ -90,10 +90,19 @@ def history(client, target: Target, *, limit: int = 200,
 
 
 def common_chats(client, user: Target, *, limit: int = 100) -> list[dict]:
-    """Groups/channels in common with a user - powerful for linking an actor."""
+    """Groups/channels in common with a user - powerful for linking an actor.
+
+    Telethon has no high-level helper (get_common_chats is a Pyrogram method),
+    so this calls the raw messages.getCommonChats. Only a user account may call
+    it - not a bot - which is exactly MTProto mode.
+    """
+    from telethon import utils
+    from telethon.tl import functions
     entity = client.get_entity(user)
+    result = client(functions.messages.GetCommonChatsRequest(
+        user_id=utils.get_input_user(entity), max_id=0, limit=limit))
     out = []
-    for chat in client.get_common_chats(entity):
+    for chat in getattr(result, "chats", []):
         out.append({
             "id": chat.id,
             "kind": _entity_kind(chat),
