@@ -1467,11 +1467,16 @@ class InvestigatorPage(BasePage):
         top.addWidget(self.sources_btn); top.addWidget(ov); top.addStretch(1)
         ll.addLayout(top)
         self.search = QLineEdit()
-        self.search.setPlaceholderText("Filter, or paste @handle / id + Enter")
+        self.search.setPlaceholderText("Type a @handle / id or name to investigate")
         self.search.returnPressed.connect(self._manual_subject)
         self._filter_timer = QTimer(self); self._filter_timer.setSingleShot(True)
-        self._filter_timer.timeout.connect(self._fill_list)
+        self._filter_timer.timeout.connect(self._on_search)
         self.search.textChanged.connect(lambda: self._filter_timer.start(250))
+        # Enrichment auto-runs when a subject opens, but debounced: typing a handle
+        # live opens a subject per keystroke, and we must not fire a lookup each time.
+        self._enrich_debounce = QTimer(self); self._enrich_debounce.setSingleShot(True)
+        self._enrich_debounce.timeout.connect(self._fire_enrich)
+        self._pending_enrich = None
         ll.addWidget(self.search)
         self.subjects = QListWidget()
         self.subjects.itemClicked.connect(
@@ -1525,6 +1530,26 @@ class InvestigatorPage(BasePage):
             shown += 1
             if shown >= 500:
                 break
+
+    def _on_search(self) -> None:
+        """Live, on every keystroke: filter the list, and drive the right panel.
+
+        No match among the collected users -> show the typed @handle/id as an
+        unseen subject ("user not found") WITH the enrichment tools, so you can
+        investigate someone the bots never saw. Narrowed to a single known user
+        -> open it (with its tools). Anything broader -> keep the list to pick from.
+        """
+        self._fill_list()
+        q = self.search.text().strip()
+        if not q:
+            return   # cleared: leave whatever is on the right (overview / open subject)
+        n = self.subjects.count()
+        if n == 0:
+            subj = _parse_subject(q)
+            if subj is not None:
+                self._open_subject(subj, graph.user_key(subj.user_id, subj.handle()))
+        elif n == 1:
+            self._open_key(self.subjects.item(0).data(Qt.ItemDataRole.UserRole))
 
     def _manual_subject(self) -> None:
         subj = _parse_subject(self.search.text())
@@ -1693,6 +1718,7 @@ class InvestigatorPage(BasePage):
 
     def _open_subject(self, subject, key) -> None:
         self._subject_key = key
+        self._subject = subject
         self._clear_dossier()
         card = QFrame(); card.setObjectName("Card")
         lay = QVBoxLayout(card); lay.setContentsMargins(16, 14, 16, 14); lay.setSpacing(4)
@@ -1713,6 +1739,13 @@ class InvestigatorPage(BasePage):
             idbits.append("@" + ((ent and ent.attrs.get("username")) or subject.handle()))
         sub = QLabel("  ·  ".join(idbits) or "no local data - enrich below")
         sub.setObjectName("Muted"); lay.addWidget(sub)
+
+        unseen = ent is None and not msgs
+        if unseen:
+            nf = QLabel("User not found in your collected data - use the enrichment "
+                        "tools below to investigate this account.")
+            nf.setWordWrap(True); nf.setStyleSheet(f"color:{ACCENT};")
+            lay.addWidget(nf)
 
         groups = sorted((k for k in g.neighbors(key) if g.entities[k].kind == graph.GROUP),
                         key=lambda k: -g.degree(k)) if (g and ent) else []
@@ -1741,23 +1774,23 @@ class InvestigatorPage(BasePage):
             lay.addWidget(Collapsible("Most-used words", lambda m=msgs: self._words(m)))
             lay.addWidget(Collapsible(f"Messages ({len(msgs)})", lambda m=msgs: self._messages(m)))
 
-        # Enrichment: one button per provider, greyed (with a reason) when not set up.
-        lay.addWidget(self._section("Enrich from outside sources · experimental"))
-        lay.addWidget(self._muted("Best-effort third-party lookups - may be partial, "
-                                  "rate-limited, or need credentials/a paid tier."))
-        er = QHBoxLayout(); er.setSpacing(8)
-        runall = icon_button("Run all ready", "search")
-        runall.clicked.connect(lambda: self._run_enrich(subject, None))
-        er.addWidget(runall)
-        for p in enrich.providers():
-            b = icon_button(_PROV_LABEL.get(p.name, p.name), _PROV_ICON.get(p.name, "search"))
-            ok, why = p.ready()
-            b.setEnabled(ok)
-            b.setToolTip(why or p.label)
-            b.clicked.connect(lambda _=False, pr=p: self._run_enrich(subject, pr))
-            er.addWidget(b)
-        er.addStretch(1)
-        ew = QWidget(); ew.setLayout(er); lay.addWidget(ew)
+        # Enrichment runs automatically and shows ONE consolidated, de-duplicated
+        # report. The dork "web leads" are Google/DuckDuckGo/Lyzem SEARCH URLs to
+        # open in a browser, not data - previewing a search page inline is useless -
+        # so they live in a dropdown, never in the report.
+        lay.addWidget(self._section("Enrichment · experimental"))
+        bar = QHBoxLayout(); bar.setSpacing(8)
+        self._enrich_status = self._muted("Running enrichment...")
+        self._leads_btn = QToolButton(); self._leads_btn.setText("Web leads")
+        self._leads_btn.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
+        self._leads_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._leads_menu = QMenu(self._leads_btn); style_menu(self._leads_menu)
+        self._leads_btn.setMenu(self._leads_menu); self._leads_btn.setEnabled(False)
+        rerun = icon_button("Re-run", "refresh")
+        rerun.clicked.connect(lambda _=False, s=subject, k=key: self._auto_enrich(s, k))
+        bar.addWidget(self._enrich_status, 1)
+        bar.addWidget(self._leads_btn); bar.addWidget(rerun)
+        bw = QWidget(); bw.setLayout(bar); lay.addWidget(bw)
 
         # Propose a personal account when the credentialed providers aren't set up.
         tp = next((p for p in enrich.providers() if p.name == "telethon"), None)
@@ -1775,6 +1808,9 @@ class InvestigatorPage(BasePage):
 
         lay.addStretch(1)
         self.dossier_lay.addWidget(card)
+        # Auto-run, debounced (live-typing opens a subject per keystroke).
+        self._pending_enrich = (subject, key)
+        self._enrich_debounce.start(450)
 
     # bar builders (lazy, inside collapsibles)
     def _groups_bar(self, groups):
@@ -1855,44 +1891,278 @@ class InvestigatorPage(BasePage):
             if w:
                 w.deleteLater()
 
-    def _run_enrich(self, subject, which) -> None:
-        self._clear_enrich()
-        provs = [which] if which is not None else [p for p in enrich.providers() if p.ready()[0]]
+    def _fire_enrich(self) -> None:
+        pe = self._pending_enrich
+        if pe and pe[1] == self._subject_key:
+            self._auto_enrich(pe[0], pe[1])
+
+    def _auto_enrich(self, subject, key) -> None:
+        # One run, all ready providers, consolidated + de-duplicated. A run id
+        # fences off stale results if the subject changed mid-lookup.
+        self._enrich_run = getattr(self, "_enrich_run", 0) + 1
+        self._leads, self._data, self._errors, self._msgs = [], {}, [], []
+        self._msg_note = None
+        self._clear_enrich(); self._render_leads()
+        provs = [p for p in enrich.providers() if p.ready()[0]]
         if not provs:
-            self._add_finding_row("No provider is ready. Set up TGStat / Telethon in the Keys tab.",
-                                  muted=True)
+            self._enrich_status.setText(
+                "No enrichment source ready - connect Telethon / add a TGStat key in Keys.")
             return
-        self._add_finding_row("Running " + ", ".join(p.name for p in provs) + "...", muted=True)
+        self._enrich_status.setText("Running " + ", ".join(p.name for p in provs) + "...")
         w = EnrichWorker(provs, subject)
-        self._enrich_worker = w
-        self.main._track(w)
-        w.result.connect(self._on_enrich)
+        self._enrich_worker = w; self.main._track(w)
+        rid = self._enrich_run
+        w.result.connect(lambda r, i=rid: self._on_enrich_result(r, i))
+        w.done.connect(lambda i=rid: self._on_enrich_done(i))
         w.start()
 
-    def _on_enrich(self, result) -> None:
+    def _on_enrich_result(self, result, rid) -> None:
+        if rid != getattr(self, "_enrich_run", 0):
+            return   # a newer subject superseded this run
         if not result.ok:
-            self._add_finding_row(f"[{result.provider}] {result.error}", muted=True)
+            msg = f"[{result.provider}] {result.error}"
+            if msg not in self._errors:
+                self._errors.append(msg)
+            self._render_report()
             return
         for f in result.findings:
-            self._add_finding_row(f"[{f.source}] {f.value}", url=f.url,
-                                  strong=(f.confidence == "confirmed"))
+            if f.kind == "lead" and f.url:
+                if f.url not in {l.url for l in self._leads}:   # same search, one entry
+                    self._leads.append(f)
+            elif f.kind == "message":
+                # Their own words, pulled from a shared group via your account.
+                self._msgs.append({"text": f.value, "group": f.detail.get("group"),
+                                   "date": f.detail.get("date")})
+            elif f.kind == "msgnote":
+                self._msg_note = f.value   # why shared-group messages couldn't be read
+            else:
+                # De-dupe real data across tools: same (kind, value) -> one row,
+                # crediting every source that reported it.
+                k = (f.kind, (f.value or "").strip().lower())
+                rec = self._data.get(k)
+                if rec is None:
+                    self._data[k] = {"kind": f.kind, "value": f.value, "url": f.url,
+                                     "conf": f.confidence, "sources": {f.source},
+                                     "detail": f.detail}
+                else:
+                    rec["sources"].add(f.source)
+                    if f.confidence == "confirmed":
+                        rec["conf"] = "confirmed"
+                    if f.url and not rec["url"]:
+                        rec["url"] = f.url
+        self._render_leads(); self._render_report()
 
-    def _add_finding_row(self, text, *, url=None, muted=False, strong=False) -> None:
+    def _on_enrich_done(self, rid) -> None:
+        if rid != getattr(self, "_enrich_run", 0):
+            return
+        srcs = set().union(*(r["sources"] for r in self._data.values())) if self._data else set()
+        if self._data or self._leads or self._msgs:
+            parts = [f"{len(self._data)} finding(s) from {len(srcs)} source(s)"]
+            if self._msgs:
+                parts.append(f"{len(self._msgs)} messages")
+            parts.append(f"{len(self._leads)} web leads")
+            self._enrich_status.setText("  ·  ".join(parts))
+        else:
+            self._enrich_status.setText("No external data found - try the Web leads.")
+
+    # ---- enrichment rendering ----
+    _REPORT_ORDER = ["flag", "profile", "alias", "bio", "stat", "group"]
+    _REPORT_LABEL = {"flag": "Flags", "profile": "Identity", "alias": "Aliases",
+                     "bio": "Bio", "stat": "Stats", "group": "Groups in common"}
+
+    def _render_leads(self) -> None:
+        self._leads_menu.clear()
+        for f in self._leads:
+            act = self._leads_menu.addAction(f.value)
+            act.triggered.connect(lambda _=False, u=f.url: QDesktopServices.openUrl(QUrl(u)))
+        self._leads_btn.setEnabled(bool(self._leads))
+        self._leads_btn.setText(f"Web leads ({len(self._leads)})" if self._leads else "Web leads")
+
+    def _badge(self, text, color):
+        lab = QLabel(text)
+        lab.setStyleSheet(f"background:{color}; color:white; border-radius:9px; "
+                          "padding:2px 10px; font-weight:600; font-size:11px;")
+        return lab
+
+    def _row_wrap(self, layout):
+        w = QWidget(); w.setStyleSheet("background:transparent;"); w.setLayout(layout)
+        return w
+
+    def _avatar_widget(self, data):
+        from PyQt6.QtGui import QPixmap
+        av = QLabel(); av.setFixedSize(54, 54)
+        av.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        photo = next((r for r in data if r["kind"] == "photo"), None)
+        if photo:
+            pm = QPixmap(photo["value"])
+            if not pm.isNull():
+                av.setPixmap(pm.scaled(54, 54, Qt.AspectRatioMode.KeepAspectRatio,
+                                       Qt.TransformationMode.SmoothTransformation))
+                av.setStyleSheet("border-radius:8px;")
+                return av
+        ident = next((r for r in data if r["kind"] == "profile"
+                      and (r.get("detail") or {}).get("id")), None)
+        nm = ((ident or {}).get("detail") or {}).get("first_name") \
+            or (self._subject.display() if getattr(self, "_subject", None) else "?")
+        av.setText((nm or "?").lstrip("@")[:1].upper() or "?")
+        av.setStyleSheet(f"background:{ACCENT}; color:white; border-radius:27px; "
+                         "font-weight:700; font-size:22px;")
+        return av
+
+    def _render_report(self) -> None:
+        self._clear_enrich()
+        box = self._enrich_box
+        data = list(self._data.values())
+        of = lambda kind: [r for r in data if r["kind"] == kind]
+        profiles = of("profile")
+        ident = next((r for r in profiles if (r.get("detail") or {}).get("id")), None)
+        det = (ident or {}).get("detail") or {}
+        handle = (det.get("username")
+                  or (self._subject.handle() if getattr(self, "_subject", None) else None))
+
+        # ---- header: avatar + name + @handle/id + flag badges ----
+        head = QHBoxLayout(); head.setSpacing(12)
+        head.addWidget(self._avatar_widget(data), 0, Qt.AlignmentFlag.AlignTop)
+        nb = QVBoxLayout(); nb.setSpacing(2)
+        name = (det.get("first_name") or det.get("title")
+                or (self._subject.display() if getattr(self, "_subject", None) else "?"))
+        nlab = QLabel(name); nlab.setStyleSheet("font-weight:700; font-size:15px;")
+        nlab.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        nb.addWidget(nlab)
+        bits = []
+        if handle:
+            bits.append("@" + handle)
+        if det.get("id"):
+            bits.append(f"id {det['id']}")
+        if det.get("phone"):
+            bits.append(det["phone"])
+        if bits:
+            sub = QLabel("   ·   ".join(bits)); sub.setObjectName("Muted")
+            sub.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+            nb.addWidget(sub)
+        flags = of("flag")
+        if flags:
+            fr = QHBoxLayout(); fr.setSpacing(6)
+            for rec in flags:
+                fr.addWidget(self._badge(rec["value"], DANGER))
+            fr.addStretch(1)
+            nb.addWidget(self._row_wrap(fr))
+        head.addLayout(nb, 1)
+        box.addWidget(self._row_wrap(head))
+
+        # ---- headline tiles ----
+        groups = of("group")
+        tiles = []
+        if groups:
+            tiles.append(("Groups in common", str(len(groups))))
+        if self._msgs:
+            tiles.append(("Messages found", str(len(self._msgs))))
+        if tiles:
+            tr = QHBoxLayout(); tr.setSpacing(10)
+            for n, v in tiles:
+                tr.addWidget(stat_tile(n, v))
+            tr.addStretch(1)
+            box.addWidget(self._row_wrap(tr))
+
+        # ---- details (profile facts minus the header identity) / bio / aliases / stats ----
+        facts = [r for r in profiles if r is not ident]
+        if facts:
+            box.addWidget(self._section("Details"))
+            for rec in facts:
+                box.addWidget(self._report_row(rec))
+        for rec in of("bio"):
+            box.addWidget(self._section("Bio"))
+            txt = rec["value"][4:] if rec["value"].lower().startswith("bio:") else rec["value"]
+            lab = QLabel(txt.strip()); lab.setWordWrap(True); lab.setStyleSheet("font-style:italic;")
+            lab.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+            box.addWidget(lab)
+        aliases = [r for r in of("alias")
+                   if r["value"].lstrip("@").lower() != (handle or "").lower()]
+        if aliases:
+            box.addWidget(self._section("Aliases"))
+            for rec in aliases:
+                box.addWidget(self._report_row(rec))
+        stats = of("stat")
+        if stats:
+            box.addWidget(self._section("Stats"))
+            for rec in stats:
+                box.addWidget(self._report_row(rec))
+
+        # ---- groups in common ----
+        if groups:
+            box.addWidget(self._section(f"Groups in common ({len(groups)})"))
+            for rec in groups[:10]:
+                box.addWidget(self._report_row(rec))
+            if len(groups) > 10:
+                box.addWidget(Collapsible(f"{len(groups) - 10} more groups",
+                                          lambda rr=groups[10:]: self._report_list(rr)))
+
+        # ---- the pivot: their own messages, grouped by shared group ----
+        if self._msgs:
+            by: dict = {}
+            for m in self._msgs:
+                by.setdefault(m.get("group") or "?", []).append(m)
+            box.addWidget(self._section(
+                f"What they posted in your shared groups ({len(self._msgs)})"))
+            for gname, ms in by.items():
+                ms = sorted(ms, key=lambda m: -(m.get("date") or 0))
+                box.addWidget(Collapsible(f"{gname} ({len(ms)})",
+                                          lambda mm=ms: self._msgs_list(mm), open=len(by) <= 2))
+        elif groups:
+            box.addWidget(self._section("Messages in shared groups"))
+            if self._msg_note:
+                box.addWidget(self._muted(f"Couldn't read their messages: {self._msg_note}"))
+            else:
+                box.addWidget(self._muted("No messages from them in your shared groups - "
+                                          "they may just be a member, or history is restricted."))
+
+        for msg in self._errors:
+            box.addWidget(self._muted(msg))
+
+    def _msg_row(self, m):
+        from datetime import datetime, timezone
+        row = QWidget(); row.setStyleSheet("background:transparent;")
+        v = QVBoxLayout(row); v.setContentsMargins(0, 2, 0, 2); v.setSpacing(1)
+        d = (datetime.fromtimestamp(m["date"], timezone.utc).strftime("%Y-%m-%d %H:%M")
+             if m.get("date") else "")
+        meta = QLabel(f"{m.get('group') or ''}  ·  {d}")
+        meta.setObjectName("Muted"); meta.setStyleSheet("font-size:11px;")
+        txt = QLabel(m.get("text") or ""); txt.setWordWrap(True)
+        txt.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        v.addWidget(meta); v.addWidget(txt)
+        return row
+
+    def _msgs_list(self, msgs):
+        box = QWidget(); box.setStyleSheet("background:transparent;")
+        l = QVBoxLayout(box); l.setContentsMargins(0, 0, 0, 0); l.setSpacing(2)
+        for m in msgs:
+            l.addWidget(self._msg_row(m))
+        return box
+
+    def _report_list(self, recs):
+        box = QWidget(); box.setStyleSheet("background:transparent;")
+        l = QVBoxLayout(box); l.setContentsMargins(0, 0, 0, 0); l.setSpacing(2)
+        for rec in recs:
+            l.addWidget(self._report_row(rec))
+        return box
+
+    def _report_row(self, rec):
         row = QWidget(); row.setStyleSheet("background:transparent;")
         rl = QHBoxLayout(row); rl.setContentsMargins(0, 1, 0, 1); rl.setSpacing(8)
-        lab = QLabel(text); lab.setWordWrap(True)
-        if muted:
-            lab.setObjectName("Muted")
-        if strong:
-            lab.setStyleSheet("font-weight:600;")
+        lab = QLabel(f"{rec['value']}   ·   {', '.join(sorted(rec['sources']))}")
+        lab.setWordWrap(True)
         lab.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        if rec["kind"] == "flag":
+            lab.setStyleSheet(f"color:{DANGER}; font-weight:600;")
+        elif rec["conf"] == "confirmed":
+            lab.setStyleSheet("font-weight:600;")
         rl.addWidget(lab, 1)
-        if url:
+        if rec["url"]:
             op = QPushButton("Open"); op.setFixedHeight(24)
             op.setCursor(Qt.CursorShape.PointingHandCursor)
-            op.clicked.connect(lambda _=False, u=url: QDesktopServices.openUrl(QUrl(u)))
+            op.clicked.connect(lambda _=False, u=rec["url"]: QDesktopServices.openUrl(QUrl(u)))
             rl.addWidget(op, 0, Qt.AlignmentFlag.AlignTop)
-        self._enrich_box.addWidget(row)
+        return row
 
 
 class NexusPage(BasePage):

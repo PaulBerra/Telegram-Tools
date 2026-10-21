@@ -92,17 +92,73 @@ class TelethonProvider(Provider):
             if info.get("phone"):
                 findings.append(Finding(self.name, "profile", f"Phone: {info['phone']}",
                                         confidence="confirmed"))
+            # Profile photo -> local file, shown as the avatar in the report.
+            try:
+                import os
+                cache = os.path.join(os.path.expanduser("~"), ".telegram_tools", "avatars")
+                pp = features.download_profile_photo(client, target, cache)
+                if pp:
+                    findings.append(Finding(self.name, "photo", pp, detail={"path": pp}))
+            except Exception:
+                pass
             if info.get("scam"):
                 findings.append(Finding(self.name, "flag", "Telegram flags this account as SCAM",
                                         confidence="confirmed"))
             if info.get("fake"):
                 findings.append(Finding(self.name, "flag", "Telegram flags this account as FAKE",
                                         confidence="confirmed"))
+            # Deeper profile (GetFullUser + the User object): bio, last-seen,
+            # premium/restricted/deleted, story & photo presence, common-chat count.
             try:
-                for chat in features.common_chats(client, target, limit=200):
+                full = features.full_profile(client, target)
+                if full.get("about"):
+                    findings.append(Finding(self.name, "bio", f"Bio: {full['about']}",
+                                            confidence="confirmed"))
+                if full.get("last_seen"):
+                    findings.append(Finding(self.name, "profile",
+                                            f"Last seen: {full['last_seen']}", confidence="confirmed"))
+                if full.get("premium"):
+                    findings.append(Finding(self.name, "profile", "Telegram Premium account",
+                                            confidence="confirmed"))
+                if full.get("deleted"):
+                    findings.append(Finding(self.name, "flag", "Account is deleted",
+                                            confidence="confirmed"))
+                if full.get("restricted"):
+                    rr = full.get("restriction_reason")
+                    findings.append(Finding(self.name, "flag",
+                                            "Restricted account" + (f" ({rr})" if rr else ""),
+                                            confidence="confirmed"))
+                if full.get("common_chats_count"):
+                    findings.append(Finding(self.name, "stat",
+                                            f"{full['common_chats_count']} group(s) in common "
+                                            "(Telegram's count)", confidence="confirmed"))
+                if full.get("has_stories"):
+                    findings.append(Finding(self.name, "profile", "Has pinned stories",
+                                            confidence="confirmed"))
+                if full.get("photo_count"):
+                    findings.append(Finding(self.name, "stat",
+                                            f"{full['photo_count']} profile photo(s)",
+                                            confidence="confirmed"))
+                if full.get("blocked"):
+                    findings.append(Finding(self.name, "profile", "Has blocked your account",
+                                            confidence="confirmed"))
+            except Exception as exc:
+                findings.append(Finding(self.name, "lead", f"Full-profile lookup failed: {exc}"))
+            try:
+                first_err = None
+                for chat in features.common_chats_with_messages(client, target):
                     nm = chat.get("title") or chat.get("username") or chat.get("id")
                     findings.append(Finding(self.name, "group", f"{nm} ({chat.get('kind')})",
                                             confidence="confirmed", detail=chat))
+                    for m in chat.get("messages", []):
+                        findings.append(Finding(self.name, "message", m["text"],
+                                                confidence="confirmed",
+                                                detail={"group": nm, "date": m.get("date"),
+                                                        "message_id": m.get("message_id")}))
+                    if chat.get("error") and first_err is None:
+                        first_err = chat["error"]
+                if first_err:
+                    findings.append(Finding(self.name, "msgnote", first_err))
             except Exception as exc:
                 findings.append(Finding(self.name, "lead", f"Common-groups lookup failed: {exc}"))
             return EnrichmentResult(self.name, findings=findings)

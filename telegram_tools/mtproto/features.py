@@ -58,6 +58,63 @@ def _user_dict(u: Any) -> dict:
     }
 
 
+def _status_text(status: Any) -> Optional[str]:
+    """Human-readable 'last seen' from a User.status (privacy-dependent; may be
+    hidden). Uses the type name so we don't import every status class."""
+    if status is None:
+        return None
+    name = type(status).__name__
+    mapping = {
+        "UserStatusOnline": "online now",
+        "UserStatusRecently": "last seen recently",
+        "UserStatusLastWeek": "last seen within a week",
+        "UserStatusLastMonth": "last seen within a month",
+    }
+    if name in mapping:
+        return mapping[name]
+    if name == "UserStatusOffline":
+        was = getattr(status, "was_online", None)
+        return f"last seen {was:%Y-%m-%d %H:%M UTC}" if was else "offline"
+    return name
+
+
+def full_profile(client, target: Target) -> dict:
+    """Deeper profile than ``resolve``: bio, last-seen, premium/restricted/deleted,
+    Telegram's own common-chats count, and story/photo presence. User account only
+    (uses users.GetFullUser plus the User object). Every piece is best-effort:
+    privacy settings can hide most of it, so missing keys are normal."""
+    from telethon.tl import functions
+    entity = client.get_entity(target)
+    out: dict[str, Any] = {
+        "id": getattr(entity, "id", None),
+        "premium": getattr(entity, "premium", None),
+        "restricted": getattr(entity, "restricted", None),
+        "deleted": getattr(entity, "deleted", None),
+        "bot": getattr(entity, "bot", None),
+        "last_seen": _status_text(getattr(entity, "status", None)),
+    }
+    rr = getattr(entity, "restriction_reason", None)
+    if rr:
+        out["restriction_reason"] = "; ".join(
+            f"{getattr(r, 'platform', '?')}:{getattr(r, 'reason', '?')}" for r in rr)
+    try:
+        full = client(functions.users.GetFullUserRequest(entity))
+        fu = getattr(full, "full_user", None)
+        if fu is not None:
+            out["about"] = getattr(fu, "about", None)
+            out["common_chats_count"] = getattr(fu, "common_chats_count", None)
+            out["blocked"] = getattr(fu, "blocked", None)
+            out["has_stories"] = bool(getattr(fu, "stories_pinned_available", None))
+    except Exception:
+        pass
+    try:
+        photos = client.get_profile_photos(entity, limit=1)
+        out["photo_count"] = getattr(photos, "total", None)
+    except Exception:
+        pass
+    return out
+
+
 def members(client, target: Target, *, limit: Optional[int] = None,
             search: str = "") -> list[dict]:
     """Enumerate the members of a group/channel (Bot API cannot do this)."""
@@ -109,6 +166,52 @@ def common_chats(client, user: Target, *, limit: int = 100) -> list[dict]:
             "title": getattr(chat, "title", None),
             "username": getattr(chat, "username", None),
         })
+        if len(out) >= limit:
+            break
+    return out
+
+
+def download_profile_photo(client, user: Target, dest_dir: str) -> Optional[str]:
+    """Download the user's current profile photo into ``dest_dir``. Returns the
+    local path, or None if they have no photo / it's hidden by privacy."""
+    import os
+    entity = client.get_entity(user)
+    os.makedirs(dest_dir, exist_ok=True)
+    dest = os.path.join(dest_dir, f"{getattr(entity, 'id', 'photo')}.jpg")
+    return client.download_profile_photo(entity, file=dest)
+
+
+def common_chats_with_messages(client, user: Target, *, limit: int = 200,
+                               msg_groups: int = 8, msg_limit: int = 25) -> list[dict]:
+    """Groups in common with a user AND, for the first ``msg_groups`` of them, that
+    user's own recent messages there - read through YOUR account, no bot, no
+    forward. This is the pivot: what the target actually said, and where. Each
+    group dict carries a ``messages`` list (possibly empty: privacy, or none sent)."""
+    from telethon.tl import functions
+    entity = client.get_entity(user)
+    result = client(functions.messages.GetCommonChatsRequest(
+        user_id=utils.get_input_user(entity), max_id=0, limit=limit))
+    out: list[dict] = []
+    for i, chat in enumerate(getattr(result, "chats", [])):
+        info = {
+            "id": chat.id,
+            "kind": _entity_kind(chat),
+            "title": getattr(chat, "title", None),
+            "username": getattr(chat, "username", None),
+            "messages": [],
+        }
+        if i < msg_groups:
+            try:
+                for m in client.iter_messages(chat, from_user=entity, limit=msg_limit):
+                    if getattr(m, "message", None):
+                        info["messages"].append({
+                            "message_id": m.id,
+                            "date": int(m.date.timestamp()) if getattr(m, "date", None) else None,
+                            "text": m.message,
+                        })
+            except Exception as exc:
+                info["error"] = str(exc)   # surfaced to the UI, not swallowed
+        out.append(info)
         if len(out) >= limit:
             break
     return out
