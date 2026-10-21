@@ -2,7 +2,7 @@
 
 # Telegram Tools
 
-A Telegram **OSINT toolkit built around bots**. You drive a bot (and, in advanced mode, a user account) to investigate chats: profile a bot from its token, inspect members and rights, recover and archive message history, and turn a dump into intelligence (links, senders, crypto addresses, phone numbers...) from a dashboard.
+A Telegram **OSINT toolkit built around bots**. Point it at a bot's token - typically one you've **recovered or obtained** during an investigation, not a bot you own or administer - and see what that bot can already see: profile it from its token, inspect the chats it's in, its members and rights, recover and archive the message history it can reach, and turn a dump into intelligence (links, senders, crypto addresses, phone numbers...) from a dashboard. A user account (advanced mode) adds what the Bot API forbids.
 
 It ships as a **CLI** (`telegram_tools_cli.py`) and a **PyQt6 GUI** (`main.py`) that share the same core, so both do exactly the same things.
 
@@ -28,7 +28,7 @@ In the GUI, type your bot token at the top (it auto-connects and is remembered) 
 
 Messages are collected passively as the bot sees them, and older ones are walked in the background (rate-limit aware, a few chats at a time, the open chat first). The gear (bottom-right) opens **Settings** - pace, theme incl. **dark mode**, limits - and **Manage bots**, which permanently deletes stored data. On the CLI the token can also come from the `TELEGRAM_BOT_TOKEN` environment variable.
 
-> OSINT reminder: this works on public data and your own bots' collected data only. External enrichment is best-effort and partial (Telegram exposes no "which groups is this user in"), every finding is labelled with its source, and it's meant for authorized anti-scam investigation - not for intruding into private groups.
+> OSINT reminder: this reads only what a connected bot (or your own user account) can already access - no exploit, no privilege escalation. External enrichment is best-effort and partial (Telegram exposes no "which groups is this user in"), every finding is labelled with its source, and it's meant for **authorized** anti-scam investigation - not for intruding into private groups.
 
 ## Usage
 
@@ -55,7 +55,7 @@ The Bot API can't read history. But message ids are sequential, so starting from
 | Full member list | no | admins only | yes, if member |
 | A user never seen (real id, scam flags, common groups) | no | no | yes, no join needed |
 
-¹ default "group privacy": disable it in @BotFather or make the bot admin to receive every message. ² a bot can only forward messages it had access to **when they were sent**; promoting it later does not unlock older ones - only a member **user account** can read those.
+¹ default "group privacy": a member bot receives only these. You work with the bot's **existing** access - changing its privacy (@BotFather) or making it admin needs control of the bot/group, which in an OSINT setting you usually don't have; with a recovered token you take whatever access it already has. ² a bot can only forward messages it had access to **when they were sent**; promoting it later does not unlock older ones - only a member **user account** can read those.
 
 ### Advanced (MTProto)
 
