@@ -45,9 +45,23 @@ python telegram_tools_cli.py intel -i dump.ndjson
 
 The Bot API can't read history. But message ids are sequential, so starting from a high id and walking **down** lets a bot forward (and thus capture the content of) messages it never received - including ones older than it. That's what `archive-messages` does; it writes NDJSON incrementally, so stopping always keeps what was collected.
 
+### What you can read (limits by access)
+
+| Target | Bot – member | Bot – admin | Your account (MTProto) |
+|---|---|---|---|
+| New messages, live | commands / @mentions / replies only ¹ | all | n/a |
+| History **after** the bot got access | yes (id-walk) | yes | yes, if member |
+| History **before** the bot joined / got rights | no ² | no ² | yes, if member |
+| Full member list | no | admins only | yes, if member |
+| A user never seen (real id, scam flags, common groups) | no | no | yes, no join needed |
+
+¹ default "group privacy": disable it in @BotFather or make the bot admin to receive every message. ² a bot can only forward messages it had access to **when they were sent**; promoting it later does not unlock older ones - only a member **user account** can read those.
+
 ### Advanced (MTProto)
 
-For what the Bot API forbids - listing all members, resolving any `@username`, reading full history without forwarding - use the user-account mode (needs `api_id`/`api_hash` from <https://my.telegram.org>):
+For what the Bot API forbids - listing all members, resolving any `@username`, reading full history without forwarding - use the user-account mode (needs an `api_id`/`api_hash`).
+
+**Get your `api_id` / `api_hash`:** go to <https://my.telegram.org> → log in with your phone number (the code is sent **in the Telegram app**, not by SMS) → **API development tools** → fill the short form to create an app → copy the **App api_id** (a number) and **App api_hash** (32-char string). They belong to **your user account**, not the bot - keep them private, and prefer a dedicated/burner account for OSINT. In the GUI, paste them in **Keys** and log in; on the CLI, pass them to `login` (a 2FA password is asked only if your account has one set):
 
 ```bash
 python telegram_mtproto.py login --api-id <ID> --api-hash <HASH> --phone +...

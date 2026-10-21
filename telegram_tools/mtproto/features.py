@@ -171,6 +171,65 @@ def common_chats(client, user: Target, *, limit: int = 100) -> list[dict]:
     return out
 
 
+def _media_label(m: Any) -> Optional[str]:
+    """A short tag for a media message with no text, e.g. 'photo', 'sticker'."""
+    for attr in ("photo", "video", "voice", "video_note", "gif", "sticker",
+                 "audio", "document", "contact", "geo", "poll", "dice"):
+        if getattr(m, attr, None):
+            return attr.replace("_", " ")
+    return "media" if getattr(m, "media", None) else None
+
+
+def _richtext_plain(rt: Any) -> str:
+    """Flatten a Telegram RichText tree (bold/italic/concat/...) to plain text."""
+    if rt is None:
+        return ""
+    if isinstance(rt, str):
+        return rt
+    t = getattr(rt, "text", None)
+    if isinstance(t, str):
+        return t
+    if t is not None:
+        return _richtext_plain(t)
+    texts = getattr(rt, "texts", None)
+    if texts:
+        return "".join(_richtext_plain(x) for x in texts)
+    return ""
+
+
+def _rich_message_text(rich: Any, limit: int = 300) -> str:
+    """Pull readable text from a RichMessage's page blocks (headings, paragraphs,
+    captions). Dividers/tables/buttons carry none; we take whatever is there."""
+    parts = []
+    for b in getattr(rich, "blocks", None) or []:
+        for attr in ("title", "subtitle", "header", "text", "caption"):
+            s = _richtext_plain(getattr(b, attr, None)).strip()
+            if s:
+                parts.append(s)
+    return " ".join(" ".join(parts).split())[:limit]   # collapse whitespace, cap
+
+
+def _message_text(m: Any) -> str:
+    """Best readable text for a message: its text, else a media tag, else the text
+    of a forwarded rich/instant-view post (what many users actually post), else a
+    '[forwarded post]' marker. Empty only when there is genuinely nothing to show."""
+    t = (getattr(m, "message", None) or "").strip()
+    if t:
+        return t
+    fwd = bool(getattr(m, "fwd_from", None))
+    rich = getattr(m, "rich_message", None)
+    if rich is not None:
+        rt = _rich_message_text(rich)
+        if rt:
+            return ("↪ " + rt) if fwd else rt
+    lbl = _media_label(m)
+    if lbl:
+        return ("↪ " if fwd else "") + f"[{lbl}]"
+    if fwd:
+        return "[forwarded post]"
+    return ""
+
+
 def download_profile_photo(client, user: Target, dest_dir: str) -> Optional[str]:
     """Download the user's current profile photo into ``dest_dir``. Returns the
     local path, or None if they have no photo / it's hidden by privacy."""
@@ -203,11 +262,13 @@ def common_chats_with_messages(client, user: Target, *, limit: int = 200,
         if i < msg_groups:
             try:
                 for m in client.iter_messages(chat, from_user=entity, limit=msg_limit):
-                    if getattr(m, "message", None):
+                    text = _message_text(m)   # text / media tag / forwarded-rich text
+                    if text:
                         info["messages"].append({
                             "message_id": m.id,
                             "date": int(m.date.timestamp()) if getattr(m, "date", None) else None,
-                            "text": m.message,
+                            "text": text,
+                            "media": bool(getattr(m, "media", None)),
                         })
             except Exception as exc:
                 info["error"] = str(exc)   # surfaced to the UI, not swallowed
