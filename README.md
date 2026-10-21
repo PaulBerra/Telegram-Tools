@@ -35,7 +35,7 @@ GUI: paste a bot token at the top, pick a chat - every tab shares them.
 
 ## User account (MTProto)
 
-Needs an `api_id`/`api_hash`: <https://my.telegram.org> → log in (code sent **in the app**) → **API development tools** → create an app → copy both. They're yours, not the bot's - keep private, use a burner. Paste in **Keys**, or:
+Needs an `api_id`/`api_hash`: <https://my.telegram.org> → log in (code sent **in the app**) → **API development tools** → create an app → copy both. They're yours, not the bot's - keep private. Paste in **Keys**, or:
 
 ```bash
 python telegram_mtproto.py login   --api-id <ID> --api-hash <HASH> --phone +...
